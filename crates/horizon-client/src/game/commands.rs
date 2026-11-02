@@ -85,6 +85,15 @@ pub(in crate::game) struct OtherEntity {
 pub(super) fn err(key: &str, args: &[&dyn std::fmt::Display]) -> CommandError {
     CommandError::tr(key, args)
 }
+/// SummonCommand: `tryAddFreshEntityWithPassengers` refused (a native mod
+/// cancelled the join) throws ERROR_DUPLICATE_UUID.
+fn summon_join_result(kept: bool) -> Result<(), CommandError> {
+    if kept {
+        Ok(())
+    } else {
+        Err(err("commands.summon.failed.uuid", &[]))
+    }
+}
 /// `EntityType.getDescriptionId`: `entity.<namespace>.<path>`.
 fn entity_name_key(id: &str) -> String {
     let (namespace, path) = id.split_once(':').unwrap_or(("minecraft", id));
@@ -2175,7 +2184,10 @@ impl Game<'_> {
             if self.ui.difficulty == 0 && t.category == "monster" {
                 return Err(err("commands.summon.failed.peaceful", &[]));
             }
-            self.spawn_mob_spawned(&short, pos);
+            // A native mod may cancel the join, which removes the mob again.
+            if let Some(id) = self.spawn_mob_spawned(&short, pos) {
+                summon_join_result(self.mobs.iter().any(|m| m.id == id))?;
+            }
             name = Text::translate(&entity_name_key(&kind), &[]);
         } else {
             match short.as_str() {
@@ -2202,9 +2214,7 @@ impl Game<'_> {
                         health: 5,
                     });
                     // tryAddFreshEntityWithPassengers refused: ERROR_DUPLICATE_UUID.
-                    if !self.native_joins_flush(false, self.next_entity) {
-                        return Err(err("commands.summon.failed.uuid", &[]));
-                    }
+                    summon_join_result(self.native_joins_flush(false, self.next_entity))?;
                     name = Text::translate("entity.minecraft.experience_orb", &[]);
                 }
                 "lightning_bolt" => {
@@ -2251,6 +2261,7 @@ impl Game<'_> {
                         cart.spawner = Some(Box::new(Spawner::load(&empty)));
                     }
                     self.carts.push(cart);
+                    summon_join_result(self.native_joins_flush(false, self.next_entity))?;
                     name = Text::translate(&format!("entity.minecraft.{k}"), &[]);
                 }
                 // SummonCommand.createEntity: any other type from an empty compound.
@@ -3773,6 +3784,13 @@ mod difficulty_tests {
 
 #[cfg(test)]
 mod summon_tests {
+    #[test]
+    fn a_refused_join_fails_the_summon_with_the_duplicate_uuid_error() {
+        use super::summon_join_result;
+        assert!(summon_join_result(true).is_ok());
+        let e = summon_join_result(false).unwrap_err();
+        assert_eq!(e.key, "commands.summon.failed.uuid");
+    }
     #[test]
     fn a_summoned_entity_is_named_from_its_own_namespace() {
         use super::entity_name_key;
