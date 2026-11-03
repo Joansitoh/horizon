@@ -628,6 +628,10 @@ pub fn tick(
     if m.alive() {
         super::spear_use::update_using_item(m, w, known_speed, events);
     }
+    if matches!(m.species(), Species::Villager | Species::WanderingTrader) {
+        // LivingEntity.tick: checkBedExists, with or without AI.
+        super::villager::wake_if_bed_gone(m, w, events);
+    }
     if m.no_ai {
         // Mob.aiStep still runs without AI (only serverAiStep is skipped),
         // so undead still burn in daylight and the endermite's life keeps
@@ -3913,5 +3917,90 @@ mod iron_golem_push_tests {
             Some(0),
             "a pushed animal is not an Enemy"
         );
+    }
+}
+
+#[cfg(test)]
+mod sleeping_villager_tests {
+    use super::*;
+    use crate::mobs::villager::{self, bed_facing_code};
+    use std::sync::Arc;
+
+    /// A sleeping villager (or wandering trader) in a bed at [0, 64, 0] that
+    /// is `bed` placed or not; ticked once. Returns it with its events.
+    fn tick_sleeper(species: &str, no_ai: bool, bed: bool) -> Option<(Mob, Vec<MobEvent>)> {
+        let build = move |world: &mut crate::world::World,
+                          registry: &horizon_world::registry::BlockRegistry| {
+            world
+                .chunks
+                .insert((0, 0), Arc::new(crate::chunk::Chunk::empty(0, 0)));
+            if bed {
+                let id = registry.default_state("minecraft:red_bed").unwrap();
+                world.set(0, 64, 0, id).unwrap();
+            }
+        };
+        let mut out = None;
+        crate::mobs::world::with_built_test_world(&[], build, |w, types| {
+            let kind = Arc::new(types.types[&format!("minecraft:{species}")].clone());
+            let mut m = Mob::new(1, kind, Vec3::new(0.5, 64.5, 0.5), 0.0);
+            m.no_ai = no_ai;
+            m.no_gravity = true;
+            m.persistent = true;
+            crate::mobs::villager_brain::init_brain(&mut m);
+            villager::ext_mut(&mut m).sleeping_pos = Some([0, 64, 0]);
+            m.extra.ints[1] = bed_facing_code(Some("north"));
+            let mut events = Vec::new();
+            tick(&mut m, w, &mut LegacyRandom::new(0), &mut events);
+            out = Some((m, events));
+        });
+        out
+    }
+
+    /// `LivingEntity.tick`: `checkBedExists` wakes a sleeper whose bed is gone
+    /// whether or not the mob has AI; `Villager.stopSleeping` sets LAST_WOKEN.
+    #[test]
+    fn a_sleeper_whose_bed_is_gone_wakes_with_or_without_ai() {
+        for species in ["villager", "wandering_trader"] {
+            for no_ai in [true, false] {
+                let Some((m, events)) = tick_sleeper(species, no_ai, false) else {
+                    eprintln!("sleeper wake test needs prepared vanilla resources");
+                    return;
+                };
+                assert!(!villager::sleeping(&m), "{species} NoAI={no_ai}");
+                assert_eq!(villager::sleeping_pos(&m), None, "{species} NoAI={no_ai}");
+                // The bed is gone: nothing to free.
+                assert!(
+                    !events
+                        .iter()
+                        .any(|e| matches!(e, MobEvent::BedOccupied { .. })),
+                    "{species} NoAI={no_ai}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_sleeper_with_its_bed_keeps_sleeping_without_ai() {
+        // (With AI the brain decides when to get up, so only NoAI is pinned.)
+        let Some((m, _)) = tick_sleeper("villager", true, true) else {
+            return;
+        };
+        assert!(villager::sleeping(&m));
+        assert_eq!(villager::sleeping_pos(&m), Some([0, 64, 0]));
+    }
+
+    /// Waking records LAST_WOKEN once, at the world's game time, with AI too.
+    #[test]
+    fn waking_without_a_bed_records_last_woken() {
+        for no_ai in [true, false] {
+            let Some((m, _)) = tick_sleeper("villager", no_ai, false) else {
+                return;
+            };
+            assert_eq!(
+                crate::mobs::villager_brain::last_woken(&m),
+                Some(1000),
+                "NoAI={no_ai}"
+            );
+        }
     }
 }

@@ -4526,6 +4526,16 @@ pub fn woken(m: &mut Mob, now: i64) {
         mem(m).last_woken.set(now);
     }
 }
+/// Give the villager its brain, as its first brain tick does.
+#[cfg(test)]
+pub(super) fn init_brain(m: &mut Mob) {
+    brain_mut(m);
+}
+/// The `LAST_WOKEN` memory, for tests.
+#[cfg(test)]
+pub(super) fn last_woken(m: &Mob) -> Option<i64> {
+    brain(m).and_then(|b| b.mem.last_woken.value())
+}
 /// `BellBlockEntity.updateEntities`: a bell rung within 32 blocks sets
 /// `HEARD_BELL_TIME` to the game time.
 pub fn heard_bell(m: &mut Mob, now: i64) {

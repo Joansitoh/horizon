@@ -182,9 +182,21 @@ pub fn sleep_pose(m: &Mob) -> Option<(f32, [f32; 2])> {
         _ => return None,
     })
 }
+/// `LivingEntity.tick`: a sleeper whose bed is gone wakes up
+/// (`checkBedExists` -> `stopSleeping`, then `Villager.stopSleeping` records
+/// `LAST_WOKEN`), with or without AI.
+pub fn wake_if_bed_gone(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
+    if !sleeping(m) {
+        return;
+    }
+    let bed = sleeping_pos(m).filter(|p| w.block_name(p[0], p[1], p[2]).ends_with("_bed"));
+    if bed.is_none() {
+        stop_sleeping(m, w, events);
+        super::villager_brain::woken(m, w.game_time);
+    }
+}
 /// `Villager.tick`: the unhappy counter and the gossip decay; a sleeper
-/// hurt or without its bed wakes up (`LivingEntity.hurtServer`,
-/// `LivingEntity.checkBedExists`), and lies the way its bed faces
+/// hurt wakes up (`LivingEntity.hurtServer`) and lies the way its bed faces
 /// (`getBedOrientation`). The brain does the rest.
 pub fn ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
     if m.extra.ints[0] > 0 {
@@ -198,7 +210,7 @@ pub fn ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
         if let Some(p) = bed {
             m.extra.ints[1] = bed_facing_code(w.prop(p[0], p[1], p[2], "facing"));
         }
-        if m.hurt_time > 0 || bed.is_none() {
+        if m.hurt_time > 0 {
             stop_sleeping(m, w, events);
             super::villager_brain::woken(m, w.game_time);
         }
