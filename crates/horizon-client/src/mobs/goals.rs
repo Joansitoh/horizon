@@ -1946,7 +1946,7 @@ impl AvoidEntity {
         // getNearestEntity(..., TargetingConditions.forCombat().range(maxDist)):
         // the target must be seen (line of sight) and within the range scaled by
         // its visibility.
-        let found = match &self.what {
+        match &self.what {
             Avoid::Player => {
                 let near = w.player.as_ref().is_some_and(|p| {
                     p.alive
@@ -1977,8 +1977,7 @@ impl AvoidEntity {
                 self.found = hit.map(|h| h.0);
                 hit.map(|h| h.1)
             }
-        };
-        found
+        }
     }
 }
 impl Goal for AvoidEntity {
