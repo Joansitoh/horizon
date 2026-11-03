@@ -1940,6 +1940,46 @@ impl AvoidEntity {
         self.seen_when = Some(f);
         self
     }
+    /// The entity to flee from (`AvoidEntityGoal.toAvoid`), if one is seen.
+    fn threat(&mut self, m: &mut Mob, w: &MobWorld) -> Option<Vec3> {
+        let max = f64::from(self.max_dist);
+        // getNearestEntity(..., TargetingConditions.forCombat().range(maxDist)):
+        // the target must be seen (line of sight) and within the range scaled by
+        // its visibility.
+        let found = match &self.what {
+            Avoid::Player => {
+                let near = w.player.as_ref().is_some_and(|p| {
+                    p.alive
+                        && !p.creative
+                        && self.player_when.is_none_or(|f| f(m, p))
+                        && (p.position.y - m.position.y).abs() <= max + 3.0
+                });
+                if near && m.player_in_range(w, max, true, true) {
+                    w.player.as_ref().map(|p| p.position)
+                } else {
+                    None
+                }
+            }
+            Avoid::Species(list) => {
+                let id = m.id;
+                let y = m.position.y;
+                let seen_when = self.seen_when;
+                let cands: Vec<(u32, Vec3)> = w
+                    .nearby(m.position, max, move |s| {
+                        s.id != id
+                            && list.contains(&s.species)
+                            && seen_when.is_none_or(|f| f(s))
+                            && (s.position.y - y).abs() <= 3.0 + max
+                    })
+                    .map(|s| (s.id, s.position))
+                    .collect();
+                let hit = cands.into_iter().find(|(oid, _)| m.sees(w, Who::Mob(*oid)));
+                self.found = hit.map(|h| h.0);
+                hit.map(|h| h.1)
+            }
+        };
+        found
+    }
 }
 impl Goal for AvoidEntity {
     goal_clone!();
@@ -1953,36 +1993,7 @@ impl Goal for AvoidEntity {
             return false;
         }
         let max = f64::from(self.max_dist);
-        let found = match &self.what {
-            Avoid::Player => {
-                cx.w.player
-                    .as_ref()
-                    .filter(|p| {
-                        p.alive
-                            && !p.creative
-                            && self.player_when.is_none_or(|f| f(m, p))
-                            && m.distance_sqr(p.position) <= max * max
-                            && (p.position.y - m.position.y).abs() <= max + 3.0
-                    })
-                    .map(|p| p.position)
-            }
-            Avoid::Species(list) => {
-                let id = m.id;
-                let y = m.position.y;
-                let seen_when = self.seen_when;
-                let hit =
-                    cx.w.nearby(m.position, max, move |s| {
-                        s.id != id
-                            && list.contains(&s.species)
-                            && seen_when.is_none_or(|f| f(s))
-                            && (s.position.y - y).abs() <= 3.0 + max
-                    })
-                    .map(|s| (s.id, s.position))
-                    .next();
-                self.found = hit.map(|h| h.0);
-                hit.map(|h| h.1)
-            }
-        };
+        let found = self.threat(m, cx.w);
         let Some(from) = found else { return false };
         if m.distance_sqr(from) > max * max {
             return false;
@@ -2968,5 +2979,61 @@ mod built_by_player_tests {
         let mut zombie = mob(Species::Zombie);
         zombie.extra.player_created = true;
         assert!(!zombie.built_by_player());
+    }
+}
+
+#[cfg(test)]
+mod avoid_entity_sight_tests {
+    use super::*;
+    use crate::mobs::world::{test_player, with_built_test_world};
+
+    /// `AvoidEntityGoal.canUse` finds its target through
+    /// `getNearestEntity(..., TargetingConditions.forCombat().range(maxDist))`,
+    /// which needs line of sight: a player four blocks away stays unseen
+    /// behind a stone wall and is seen as a threat in the open.
+    fn threat_seen(wall: bool) -> Option<bool> {
+        let mut out = None;
+        let build = |world: &mut crate::world::World,
+                     registry: &horizon_world::registry::BlockRegistry| {
+            let stone = registry.default_state("minecraft:stone").unwrap();
+            for cx in -3..3 {
+                for cz in -3..3 {
+                    world
+                        .chunks
+                        .insert((cx, cz), Arc::new(crate::chunk::Chunk::empty(cx, cz)));
+                }
+            }
+            for x in -40..=40 {
+                for z in -40..=40 {
+                    world.set(x, 63, z, stone).unwrap();
+                    if wall && x == 2 {
+                        for y in 64..70 {
+                            world.set(x, y, z, stone).unwrap();
+                        }
+                    }
+                }
+            }
+        };
+        let ran = with_built_test_world(&[], build, |w, types| {
+            let kind = Arc::new(types.types["minecraft:cow"].clone());
+            let mut m = Mob::new(1, kind, Vec3::new(0.5, 64.0, 0.5), 0.0);
+            let mut w = w.clone();
+            w.player = Some(test_player(Vec3::new(4.5, 64.0, 0.5)));
+            let mut goal = AvoidEntity::new(Avoid::Player, 8.0, 1.0, 1.2);
+            out = Some(goal.threat(&mut m, &w).is_some());
+        });
+        if ran { out } else { None }
+    }
+
+    #[test]
+    fn avoid_entity_needs_line_of_sight_to_the_player() {
+        let Some(open) = threat_seen(false) else {
+            return;
+        };
+        let Some(walled) = threat_seen(true) else {
+            return;
+        };
+        assert!(open, "a player in the open is fled from");
+        assert!(!walled, "a player behind a wall is not seen");
     }
 }
