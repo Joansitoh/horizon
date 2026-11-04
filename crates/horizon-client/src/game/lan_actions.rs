@@ -4568,6 +4568,21 @@ impl Game<'_> {
                         host.hub.sound(name, at, volume, pitch, source, None);
                     }
                 }
+                // LivingEntity.travelFallFlying: the crash sound is played on
+                // the server only, at the glider. Their client never runs
+                // handleFallFlyingCollisions, so the broadcast includes them.
+                MotionEvent::Fall(horizon_client::landing::FallEvent::Sound {
+                    sound,
+                    position: Some(_),
+                    volume,
+                    pitch,
+                }) if sound.player_fall_sound().is_some() => {
+                    if let Some(name) = sound.player_fall_sound() {
+                        let source = horizon_client::settings::sound_source(name) as i32;
+                        self.audio.play_unshared(name, Some(at), volume, pitch);
+                        host.hub.sound(name, at, volume, pitch, source, None);
+                    }
+                }
                 // LivingEntity.causeFallDamage: Player.playSound skips the
                 // guest, whose own client plays it; everyone else hears it.
                 MotionEvent::Fall(horizon_client::landing::FallEvent::Sound {

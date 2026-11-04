@@ -2064,7 +2064,12 @@ impl MotionWorld<'_, '_, '_> {
                     .events
                     .push(MotionEvent::Fall(crate::landing::FallEvent::Sound {
                         sound,
-                        position: None,
+                        // LivingEntity.travelFallFlying plays getFallDamageSound
+                        // only on the server. A landing leaves position None so
+                        // the guest is skipped (their client plays it); this
+                        // one has a position so the broadcast includes the
+                        // glider, whose client travel never reaches here.
+                        position: Some(BlockPos::containing(self.player.position)),
                         volume: 1.0,
                         pitch: 1.0,
                     }));
