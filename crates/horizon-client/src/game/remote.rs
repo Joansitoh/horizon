@@ -7108,11 +7108,27 @@ impl Game<'_> {
                 } else {
                     &m.extra.main_hand
                 };
+                // The main hand keeps the stack the server sent, whose patched
+                // `consumable` or `blocks_attacks` picks the animation; the
+                // off hand knows its item id only.
+                let items = world_items!(self);
+                let stack = (!m.extra.using_off_hand)
+                    .then(|| m.extra.main_hand_stack())
+                    .flatten();
                 m.extra.blocking = m.extra.using_item > 0
-                    && used
-                        .as_ref()
-                        .and_then(|i| world_items!(self).get(i))
-                        .is_some_and(|i| i.blocks_attacks.is_some());
+                    && match stack {
+                        Some(stack) => {
+                            horizon_client::item_sync::use_animation(stack, items)
+                                == horizon_world::consumable::UseAnimation::Block
+                        }
+                        None => used.as_ref().and_then(|i| items.get(i)).is_some_and(|i| {
+                            i.consumable
+                                .as_ref()
+                                .map_or(i.blocks_attacks.is_some(), |c| {
+                                    c.animation == horizon_world::consumable::UseAnimation::Block
+                                })
+                        }),
+                    };
             }
             if m.extra.using_item > 0 {
                 if player {
