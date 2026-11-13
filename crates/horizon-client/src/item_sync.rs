@@ -471,6 +471,30 @@ pub fn use_animation(stack: &ItemStack, items: &crate::items::Items) -> UseAnima
     UseAnimation::None
 }
 
+/// Whether another player's used item raises the arm (`ArmPose.BLOCK`): the
+/// main hand keeps the stack the server sent, whose patched `consumable` or
+/// `blocks_attacks` picks the animation; the off hand knows its item id only.
+pub fn remote_blocking(extra: &crate::mobs::Extra, items: &crate::items::Items) -> bool {
+    if !extra.using_off_hand
+        && let Some(stack) = extra.main_hand_stack()
+    {
+        return use_animation(stack, items) == UseAnimation::Block;
+    }
+    let used = if extra.using_off_hand {
+        &extra.off_hand
+    } else {
+        &extra.main_hand
+    };
+    let info = used.as_deref().and_then(|i| items.get(i));
+    info.is_some_and(|i| {
+        i.consumable
+            .as_ref()
+            .map_or(i.blocks_attacks.is_some(), |c| {
+                c.animation == UseAnimation::Block
+            })
+    })
+}
+
 /// Decodes the `minecraft:consumable` component from its saved/NBT tag form.
 pub fn decode_consumable_tag(tag: &Tag) -> Option<ItemConsumable> {
     let json = crate::item_render::tag_json(tag);

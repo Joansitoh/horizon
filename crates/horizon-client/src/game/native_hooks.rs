@@ -8214,11 +8214,9 @@ impl Game<'_> {
         mod_api::dispatch_use_duration(self, mod_api::mods(), stack, duration);
     }
     /// `Item.getUseAnimation` of `stack` in use, for the first person hand:
-    /// `animation` arrives as vanilla's `getUseAnimation` answers: its
-    /// consumable's, else `Block` for a stack with `blocks_attacks`, else
-    /// `None`. `Eat` and `Drink` bring the food to the mouth, `Bow` draws,
-    /// `Trident` raises, `Brush` sweeps, `Block` tilts an item that is no
-    /// shield across the body; the rest hold the item still.
+    /// `animation` arrives as `getUseAnimation` answers (consumable's, else
+    /// `Block` for `blocks_attacks`, else `None`). `Eat`/`Drink` bring food to
+    /// the mouth, `Bow` draws, `Trident` raises, `Brush` sweeps, `Block` tilts.
     /// Asked each frame the hand draws an item in use, for an item with no
     /// pose of its own (bows, crossbows, tridents, brushes and spears keep
     /// theirs). Client-side. API 90.

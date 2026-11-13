@@ -7103,32 +7103,8 @@ impl Game<'_> {
             if player {
                 // AvatarRenderer.getArmPose: the used item's BLOCK animation
                 // (an item with `blocks_attacks`) raises the arm.
-                let used = if m.extra.using_off_hand {
-                    &m.extra.off_hand
-                } else {
-                    &m.extra.main_hand
-                };
-                // The main hand keeps the stack the server sent, whose patched
-                // `consumable` or `blocks_attacks` picks the animation; the
-                // off hand knows its item id only.
-                let items = world_items!(self);
-                let stack = (!m.extra.using_off_hand)
-                    .then(|| m.extra.main_hand_stack())
-                    .flatten();
                 m.extra.blocking = m.extra.using_item > 0
-                    && match stack {
-                        Some(stack) => {
-                            horizon_client::item_sync::use_animation(stack, items)
-                                == horizon_world::consumable::UseAnimation::Block
-                        }
-                        None => used.as_ref().and_then(|i| items.get(i)).is_some_and(|i| {
-                            i.consumable
-                                .as_ref()
-                                .map_or(i.blocks_attacks.is_some(), |c| {
-                                    c.animation == horizon_world::consumable::UseAnimation::Block
-                                })
-                        }),
-                    };
+                    && horizon_client::item_sync::remote_blocking(&m.extra, world_items!(self));
             }
             if m.extra.using_item > 0 {
                 if player {
