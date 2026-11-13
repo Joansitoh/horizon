@@ -350,6 +350,10 @@ impl Game<'_> {
     ) {
         for pkt in packets {
             match horizon_protocol::packets::play::Clientbound::decode(pkt.id, &pkt.payload) {
+                // The recorded player's tab entry is for a replay that owns its session; in a live
+                // one it would list them a second time.
+                Ok(horizon_protocol::packets::play::Clientbound::PlayerInfoUpdate(_))
+                    if !self.replay.standalone => {}
                 Ok(packet) => {
                     let _ = self.handle_packet(packet);
                 }
@@ -592,6 +596,8 @@ impl Game<'_> {
         );
         match horizon_client::studio::StudioRecorder::start(path.clone(), meta) {
             Ok(recorder) => {
+                // Their own tab entry (the skin) stays in the recording; everyone else's stays out.
+                let recorder = recorder.with_own_player(r.profile);
                 r.session.start_recording(recorder, |recorder| {
                     self.dump_world_snapshot_to_recorder(recorder);
                 });
@@ -862,6 +868,10 @@ impl Game<'_> {
         // 2b. The time, weather, inventory and vitals the server sent long before this recording.
         for packet in horizon_client::studio::snapshot::packets(&self.session_snapshot_state(r)) {
             record_cb(packet);
+        }
+        // 2c. The recording player's own tab entry, so the replay shows their skin.
+        if let Some(entry) = self.recorder_tab_entry() {
+            record_cb(entry);
         }
 
         // 3. Encode resident loaded chunks into LevelChunkWithLight packets
