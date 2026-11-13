@@ -2381,6 +2381,7 @@ impl Game<'_> {
             self.pickups.clear();
             if let Some(r) = self.remote.as_mut() {
                 r.entities.clear();
+                r.entity_mirror.clear();
                 r.passenger_vehicles.clear();
                 r.lerps.clear();
                 r.cart_lerps.clear();

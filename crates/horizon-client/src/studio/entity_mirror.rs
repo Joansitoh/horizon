@@ -38,8 +38,9 @@ pub struct EntityMirror {
 }
 
 impl EntityMirror {
-    /// Takes what `packet` says about the entities in view. A new level (`Login`, `Respawn`)
-    /// empties the mirror: the server shows its entities again.
+    /// Takes what `packet` says about the entities in view. The session [`clear`](Self::clear)s
+    /// the mirror when the client drops its level: a respawn in the same level keeps its
+    /// entities, so it must not.
     pub fn apply(&mut self, packet: &C) {
         match packet {
             C::AddEntity(p) => {
@@ -59,7 +60,6 @@ impl EntityMirror {
                     self.entities.remove(id);
                 }
             }
-            C::Login(_) | C::Respawn(_) => self.entities.clear(),
             C::SetEntityData(SetEntityData { id, values }) => {
                 if let Some(entity) = self.entities.get_mut(id) {
                     for value in values {
@@ -132,6 +132,19 @@ impl EntityMirror {
                             pack_degrees(new)
                         }
                     };
+                    let motion = |bit: i32, now: f64, new: f64| {
+                        if p.relatives & bit != 0 {
+                            now + new
+                        } else {
+                            new
+                        }
+                    };
+                    let now = entity.add.velocity;
+                    entity.add.velocity = [
+                        motion(play::relative::DELTA_X, now[0], p.delta[0]),
+                        motion(play::relative::DELTA_Y, now[1], p.delta[1]),
+                        motion(play::relative::DELTA_Z, now[2], p.delta[2]),
+                    ];
                     entity.add.yaw = angle(play::relative::Y_ROT, entity.add.yaw, p.yaw);
                     entity.add.pitch = angle(play::relative::X_ROT, entity.add.pitch, p.pitch);
                 }
@@ -151,6 +164,11 @@ impl EntityMirror {
             }
             _ => {}
         }
+    }
+
+    /// Forgets every entity: the client's level is gone and the server shows its entities again.
+    pub fn clear(&mut self) {
+        self.entities.clear();
     }
 
     /// How many entities it holds.
@@ -317,7 +335,7 @@ mod tests {
         mirror.apply(&C::TeleportEntity(TeleportEntity {
             id: 3,
             position: [1.0, 100.0, -2.0],
-            delta: [0.0; 3],
+            delta: [0.0, 0.25, 0.0],
             yaw: 90.0,
             pitch: 10.0,
             relatives: play::relative::X | play::relative::Z | play::relative::Y_ROT,
@@ -326,12 +344,13 @@ mod tests {
         mirror.apply(&C::TeleportEntity(TeleportEntity {
             id: 3,
             position: [0.0, 0.0, 0.0],
-            delta: [0.0; 3],
+            delta: [0.0, 0.5, 0.0],
             yaw: 90.0,
             pitch: 10.0,
             relatives: play::relative::X
                 | play::relative::Y
                 | play::relative::Z
+                | play::relative::DELTA_Y
                 | play::relative::Y_ROT,
             on_ground: false,
         }));
@@ -350,10 +369,12 @@ mod tests {
         assert_eq!(three.position, [6.0, 100.0, 3.0]);
         assert_eq!(three.yaw, pack_degrees(180.0));
         assert_eq!(three.pitch, pack_degrees(10.0));
+        // The first teleport set the motion; the second added to it.
+        assert_eq!(three.velocity, [0.0, 0.75, 0.0]);
     }
 
     #[test]
-    fn removed_entities_and_new_levels_are_forgotten() {
+    fn removed_entities_and_a_cleared_level_are_forgotten() {
         let mut mirror = EntityMirror::default();
         for id in 1..=3 {
             mirror.apply(&add(id, [0.0; 3]));
@@ -387,21 +408,7 @@ mod tests {
                 .iter()
                 .any(|p| matches!(p, C::SetEntityData(_)))
         );
-        mirror.apply(&C::Respawn(play::Respawn {
-            spawn: play::SpawnInfo {
-                dimension_type: 1,
-                dimension: "minecraft:the_nether".into(),
-                seed: 0,
-                game_type: 0,
-                previous_game_type: None,
-                debug: false,
-                flat: false,
-                last_death: None,
-                portal_cooldown: 0,
-                sea_level: 32,
-            },
-            keep: 0,
-        }));
+        mirror.clear();
         assert!(mirror.is_empty());
     }
 
