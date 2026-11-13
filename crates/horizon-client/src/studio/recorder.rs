@@ -73,6 +73,10 @@ fn own_entry_update(update: &play::PlayerInfoUpdate, own: u128) -> Option<play::
     for entry in &mut entries {
         entry.uuid = RECORDER_UUID;
         entry.chat_session = None;
+        // Only the skin: another property is not the recording's to keep.
+        entry
+            .properties
+            .retain(|property| property.name == "textures");
         for property in &mut entry.properties {
             if property.name == "textures" {
                 let textures = crate::skins::unpack(
