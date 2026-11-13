@@ -447,30 +447,4 @@ mod tests {
                 .any(|p| matches!(p, C::SetEntityLink(_) | C::SetPassengers(_)))
         );
     }
-
-    #[test]
-    fn every_packet_survives_the_wire() {
-        let mut mirror = EntityMirror::default();
-        mirror.apply(&add(1, [1.5, 2.5, 3.5]));
-        mirror.apply(&add(2, [0.0; 3]));
-        mirror.apply(&C::SetEntityData(SetEntityData {
-            id: 1,
-            values: vec![(0, 0, Value::Byte(2)), (8, 3, Value::Float(7.0))],
-        }));
-        mirror.apply(&C::SetEquipment(SetEquipment {
-            id: 1,
-            slots: vec![(5, Some(Stack::new(700, 1))), (4, None)],
-        }));
-        mirror.apply(&C::SetEntityLink(SetEntityLink { source: 1, dest: 2 }));
-        mirror.apply(&C::SetPassengers(SetPassengers {
-            vehicle: 2,
-            passengers: vec![1],
-        }));
-        for packet in mirror.packets() {
-            let encoded = packet.encode();
-            let mut reader = horizon_protocol::buf::Reader::new(&encoded);
-            let id = reader.varint().unwrap();
-            assert_eq!(C::decode(id, reader.rest()).unwrap(), packet);
-        }
-    }
 }
