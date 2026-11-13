@@ -660,6 +660,9 @@ pub(super) struct Remote {
     /// Item entities waiting for their item data: where they are and their
     /// motion.
     pending_items: HashMap<i32, ([f64; 3], Vec3)>,
+    /// The entities in view as the server's packets last said them, for a recording that starts
+    /// mid-session (`studio::entity_mirror`).
+    pub(super) entity_mirror: horizon_client::studio::entity_mirror::EntityMirror,
     pub(super) health: (f32, i32, f32),
     /// `LocalPlayer.flashOnSetHealth`: set by the first health the server
     /// sends; from then on a drop starts the hurt animation.
@@ -1220,6 +1223,7 @@ impl Game<'_> {
             first_passenger: false,
             passenger_index: 0,
             pending_items: HashMap::new(),
+            entity_mirror: Default::default(),
             health: (20.0, 20, 5.0),
             flash_on_set_health: false,
             game_mode: 0,
@@ -1450,6 +1454,7 @@ impl Game<'_> {
             first_passenger: false,
             passenger_index: 0,
             pending_items: HashMap::new(),
+            entity_mirror: Default::default(),
             health: (20.0, 20, 5.0),
             flash_on_set_health: false,
             game_mode: 0,
@@ -3248,6 +3253,9 @@ impl Game<'_> {
 
     pub(super) fn handle_packet(&mut self, packet: C) -> Result<()> {
         self.native_client_packet(&packet);
+        if let Some(r) = self.remote.as_mut() {
+            r.entity_mirror.apply(&packet);
+        }
         match packet {
             // ClientCommonPacketListenerImpl.handlePing runs on the game
             // thread, after all preceding packets (especially teleports).

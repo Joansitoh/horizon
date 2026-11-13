@@ -140,6 +140,18 @@ impl StudioRecorder {
         }
     }
 
+    /// Record a clientbound packet the client made, at an explicit timestamp, through the same
+    /// privacy filter as the packets the server sent ([`recordable`]): an `AddEntity` gets a
+    /// fresh UUID, and the ones the filter drops are not written.
+    pub fn record_filtered_at(&self, timestamp_ms: u32, packet: &play::Clientbound) {
+        let encoded = packet.encode();
+        let mut reader = Reader::new(&encoded);
+        let Ok(id) = reader.varint() else { return };
+        if let Some((id, payload)) = recordable(packet, id, reader.rest()) {
+            self.record_packet_at(timestamp_ms, id, &payload);
+        }
+    }
+
     /// Record a clientbound packet at an explicit timestamp (e.g. 0ms for initial world baseline).
     pub fn record_packet_at(&self, timestamp_ms: u32, id: i32, payload: &[u8]) {
         if !self.active.load(Ordering::Relaxed) {
@@ -468,6 +480,70 @@ mod tests {
         assert_eq!(recorded.yaw, original.yaw);
         assert_eq!(recorded.head_yaw, original.head_yaw);
         assert_eq!(recorded.data, original.data);
+    }
+
+    #[test]
+    fn a_snapshot_packet_is_written_at_zero_through_the_privacy_filter() {
+        let dir = std::env::temp_dir().join(format!(
+            "studio_snapshot_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snapshot_test.mcpr");
+        let recorder = StudioRecorder::start(path.clone(), Metadata::default()).unwrap();
+        let uuid = 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10;
+        let entity = play::AddEntity {
+            id: 18,
+            uuid,
+            kind: 42,
+            position: [1.0, 64.0, -2.0],
+            velocity: [0.0; 3],
+            pitch: 1,
+            yaw: 2,
+            head_yaw: 3,
+            data: 4,
+        };
+        let data = play::SetEntityData {
+            id: 18,
+            values: vec![(0, 0, horizon_protocol::entity_data::Value::Byte(1))],
+        };
+        recorder.record_filtered_at(0, &play::Clientbound::AddEntity(entity.clone()));
+        recorder.record_filtered_at(0, &play::Clientbound::SetEntityData(data.clone()));
+        // A dropped packet is not written.
+        recorder.record_filtered_at(
+            0,
+            &play::Clientbound::PlayerInfoRemove(play::PlayerInfoRemove { uuids: vec![uuid] }),
+        );
+        recorder.stop().unwrap();
+
+        let mut reader = super::super::mcpr::McprReader::open(&path).unwrap();
+        assert_eq!(reader.total_packets(), 2);
+        let mut recorded = Vec::new();
+        while let Some(packet) = reader.next_packet().unwrap() {
+            assert_eq!(packet.timestamp_ms, 0);
+            recorded.push(play::Clientbound::decode(packet.id, &packet.payload).unwrap());
+        }
+        let [
+            play::Clientbound::AddEntity(added),
+            play::Clientbound::SetEntityData(kept),
+        ] = &recorded[..]
+        else {
+            panic!("unexpected snapshot packets: {recorded:?}")
+        };
+        assert_ne!(added.uuid, uuid);
+        assert_eq!(
+            play::AddEntity {
+                uuid: 0,
+                ..added.clone()
+            },
+            play::AddEntity { uuid: 0, ..entity }
+        );
+        assert_eq!(kept, &data);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

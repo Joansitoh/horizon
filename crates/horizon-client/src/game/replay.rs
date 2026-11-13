@@ -898,8 +898,17 @@ impl Game<'_> {
             );
             count += 1;
         }
+
+        // 4. The entities already in view: after the chunks they stand in. They go through the
+        // privacy filter, as the server's own would (`AddEntity` gets a fresh UUID; a later
+        // packet still matches it by entity id).
+        let entities = r.entity_mirror.packets();
+        for packet in &entities {
+            recorder.record_filtered_at(0, packet);
+        }
         log::info!(
-            "Studio Recorder: Dumped initial world snapshot ({count} chunks) at timestamp 0ms"
+            "Studio Recorder: Dumped initial world snapshot ({count} chunks, {} entities) at timestamp 0ms",
+            r.entity_mirror.len()
         );
     }
 }
