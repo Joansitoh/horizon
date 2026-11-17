@@ -6056,14 +6056,6 @@ mod tests {
         // A long list at a size where it scrolls (the same page and window the
         // wheel test above uses); the bar code is shared by every list page.
         ui.show(Page::KeyBinds);
-        let size = (1708.0, 960.0);
-        let (_, top, bottom, content) = ui.layout(&s, size.0, size.1);
-        assert!(
-            ui::scrollbar_thumb(top, bottom, content, ui.scroll).is_some(),
-            "the key binds list has more rows than the window"
-        );
-        // Just inside the bar's left edge, near its top.
-        let over = (ui.scrollbar_x(size.0) + 1.0, top + 1.0);
         let frame = |ui: &mut OptionsUi, cursor: (f32, f32)| {
             let _ = take_cursor();
             ui.draw_test_frame(
@@ -6082,6 +6074,18 @@ mod tests {
             );
             take_cursor()
         };
+        // The first frame lays the page out at the batch's GUI size, which is
+        // what `ui.size` then holds; the bar's x comes from that size, not the
+        // window's pixels.
+        let _ = frame(&mut ui, (-10.0, -10.0));
+        let (w, h) = ui.size;
+        let (_, top, bottom, content) = ui.layout(&s, w, h);
+        assert!(
+            ui::scrollbar_thumb(top, bottom, content, ui.scroll).is_some(),
+            "the key binds list has more rows than the window"
+        );
+        // Just inside the bar's left edge, near its top.
+        let over = (ui.scrollbar_x(w) + 1.0, top + 1.0);
         assert_eq!(frame(&mut ui, over), Cursor::PointingHand);
         // Pressing the bar holds it: the resize cursor, wherever the pointer is.
         ui.scrollbar_drag_y = Some(over.1);
