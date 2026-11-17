@@ -6053,12 +6053,14 @@ mod tests {
         let atlas = atlas();
         let s = Settings::default();
         let mut ui = OptionsUi::default();
-        ui.show(Page::Language);
-        let size = (480.0, 480.0);
+        // A long list at a size where it scrolls (the same page and window the
+        // wheel test above uses); the bar code is shared by every list page.
+        ui.show(Page::KeyBinds);
+        let size = (1708.0, 960.0);
         let (_, top, bottom, content) = ui.layout(&s, size.0, size.1);
         assert!(
             ui::scrollbar_thumb(top, bottom, content, ui.scroll).is_some(),
-            "the language list has more rows than the window"
+            "the key binds list has more rows than the window"
         );
         // Just inside the bar's left edge, near its top.
         let over = (ui.scrollbar_x(size.0) + 1.0, top + 1.0);
@@ -6068,7 +6070,7 @@ mod tests {
                 &s,
                 NONE,
                 &mut HudBatch::new(
-                    [480, 480],
+                    [1708, 960],
                     crate::hud::GuiScale {
                         requested: 0,
                         unicode: false,
