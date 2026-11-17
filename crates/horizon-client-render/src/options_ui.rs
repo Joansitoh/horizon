@@ -6048,6 +6048,47 @@ mod tests {
     }
 
     #[test]
+    fn pointer_cursor_on_the_list_scrollbar_points_then_resizes_while_dragged() {
+        use crate::widgets::{Cursor, take_cursor};
+        let atlas = atlas();
+        let s = Settings::default();
+        let mut ui = OptionsUi::default();
+        ui.show(Page::Language);
+        let size = (480.0, 480.0);
+        let (_, top, bottom, content) = ui.layout(&s, size.0, size.1);
+        assert!(
+            ui::scrollbar_thumb(top, bottom, content, ui.scroll).is_some(),
+            "the language list has more rows than the window"
+        );
+        // Just inside the bar's left edge, near its top.
+        let over = (ui.scrollbar_x(size.0) + 1.0, top + 1.0);
+        let frame = |ui: &mut OptionsUi, cursor: (f32, f32)| {
+            let _ = take_cursor();
+            ui.draw_test_frame(
+                &s,
+                NONE,
+                &mut HudBatch::new(
+                    [480, 480],
+                    crate::hud::GuiScale {
+                        requested: 0,
+                        unicode: false,
+                    },
+                ),
+                &atlas,
+                cursor,
+                &mut |_, _| {},
+            );
+            take_cursor()
+        };
+        assert_eq!(frame(&mut ui, over), Cursor::PointingHand);
+        // Pressing the bar holds it: the resize cursor, wherever the pointer is.
+        ui.scrollbar_drag_y = Some(over.1);
+        assert_eq!(frame(&mut ui, over), Cursor::ResizeNs);
+        ui.scrollbar_drag_y = None;
+        assert_eq!(frame(&mut ui, over), Cursor::PointingHand);
+    }
+
+    #[test]
     fn pointer_cursor_leaves_a_disabled_option_without_focusing_it() {
         use crate::widgets::{Cursor, take_cursor};
         let atlas = atlas();
