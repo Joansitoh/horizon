@@ -652,6 +652,7 @@ mod tests {
                     worker: None,
                     start_time: Instant::now(),
                     dest_path: PathBuf::from("unused.mcpr"),
+                    own_player: None,
                 };
                 // Disconnect before the recorder's blocking Drop, including on assertion failure.
                 let mut receiver = Some(receiver);
