@@ -1585,7 +1585,7 @@ mod continuous_use_tests {
         // The CASE BLOCK transform of `FirstPersonHandsAndItemsRenderer` after the arm's place
         // (translate, -102.25 about X, 13.365 about Y, 78.05 about Z), multiplied out by hand:
         // where the hand's origin and the item's X axis land, for the right then the left arm.
-        let cases = [
+        let cases: [(bool, [f32; 3], [f32; 3]); 2] = [
             (false, [0.4186, -0.44, -0.5786], [0.2015, -0.2544, -0.9459]),
             (true, [-0.4186, -0.44, -0.5786], [0.2015, 0.2544, 0.9459]),
         ];
