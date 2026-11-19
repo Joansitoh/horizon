@@ -113,7 +113,7 @@ pub fn registries(packets: &[TimestampedPacket]) -> Option<Dynamic> {
 mod tests {
     use super::*;
     use crate::studio::mcpr::{McprReader, McprWriter, Metadata};
-    use horizon_world::nbt::Tag;
+    use horizon_core::nbt::Tag;
 
     fn entry(name: &str, data: Option<Tag>) -> (String, Option<Tag>) {
         (name.to_owned(), data)
