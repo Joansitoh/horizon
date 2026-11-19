@@ -115,10 +115,6 @@ mod tests {
     use crate::studio::mcpr::{McprReader, McprWriter, Metadata};
     use horizon_core::nbt::Tag;
 
-    fn entry(name: &str, data: Option<Tag>) -> (String, Option<Tag>) {
-        (name.to_owned(), data)
-    }
-
     /// A server whose biome registry is not vanilla's order: the second entry here is where
     /// vanilla has `minecraft:plains`. Ids in the play stream only mean something with this list.
     fn server_registries() -> Dynamic {
