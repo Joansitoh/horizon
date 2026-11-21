@@ -119,7 +119,7 @@ impl Game<'_> {
     /// The local player's tab list entry as a recording keeps it (their name, game mode and
     /// skin under the recorder id), for the snapshot a recording starts with. `None` while the
     /// session has no name for them.
-    pub(super) fn recorder_tab_entry(&self) -> Option<play::Clientbound> {
+    pub(in crate::game) fn recorder_tab_entry(&self) -> Option<play::Clientbound> {
         let r = self.remote.as_ref()?;
         let name = r
             .tab_players
