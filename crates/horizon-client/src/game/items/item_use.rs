@@ -605,10 +605,9 @@ pub(super) fn count_down(ticks: u32, duration: i32) -> Option<u32> {
 
 /// The first person pose of a hand using an item of `animation`
 /// (`ItemInHandRenderer.renderArmWithItem`'s switch), for an item of no
-/// pose of its own. `shield` is a `ShieldItem`: BLOCK leaves it as it is.
+/// pose of its own.
 pub(super) fn use_pose(
     animation: UseAnimation,
-    shield: bool,
     remaining: f32,
     duration: f32,
     partial: f32,
@@ -624,16 +623,30 @@ pub(super) fn use_pose(
         UseAnimation::Bow => ItemPose::Bow { ticks_used },
         UseAnimation::Trident => ItemPose::Trident { ticks_used },
         UseAnimation::Brush => ItemPose::Brush { remaining, partial },
-        UseAnimation::Block if !shield => ItemPose::Block,
         _ => ItemPose::Using,
     }
+}
+
+/// `use_pose`, but BLOCK turns a sword (or any `blocks_attacks` item) across
+/// the body; a `ShieldItem` (`shield`) leaves it as it is.
+pub(super) fn held_use_pose(
+    animation: UseAnimation,
+    shield: bool,
+    remaining: f32,
+    duration: f32,
+    partial: f32,
+) -> horizon_client::first_person::ItemPose {
+    if animation == UseAnimation::Block && !shield {
+        return horizon_client::first_person::ItemPose::Block;
+    }
+    use_pose(animation, remaining, duration, partial)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         bow_release_power, consumes_at_once, count_down, duration_leaving, held, release_parts,
-        start_of, tick_left, ticks_left, use_counter_leaving, use_pose,
+        held_use_pose, start_of, tick_left, ticks_left, use_counter_leaving, use_pose,
     };
     use horizon_client::first_person::ItemPose;
     use horizon_core::use_animation::UseAnimation;
@@ -1139,7 +1152,7 @@ mod tests {
 
     #[test]
     fn a_use_animation_picks_the_hand_pose() {
-        let pose = |animation| use_pose(animation, false, 12.0, 32.0, 0.5);
+        let pose = |animation| use_pose(animation, 12.0, 32.0, 0.5);
         assert!(matches!(
             pose(UseAnimation::Drink),
             ItemPose::Eat { remaining, duration, partial }
@@ -1157,13 +1170,20 @@ mod tests {
             pose(UseAnimation::Brush),
             ItemPose::Brush { remaining, partial } if (remaining, partial) == (12.0, 0.5)
         ));
-        for animation in [UseAnimation::None, UseAnimation::Spyglass] {
+        for animation in [
+            UseAnimation::None,
+            UseAnimation::Block,
+            UseAnimation::Spyglass,
+        ] {
             assert!(matches!(pose(animation), ItemPose::Using));
         }
         // BLOCK turns a sword across the body but leaves a `ShieldItem` as it is.
-        assert!(matches!(pose(UseAnimation::Block), ItemPose::Block));
         assert!(matches!(
-            use_pose(UseAnimation::Block, true, 12.0, 32.0, 0.5),
+            held_use_pose(UseAnimation::Block, false, 12.0, 32.0, 0.5),
+            ItemPose::Block
+        ));
+        assert!(matches!(
+            held_use_pose(UseAnimation::Block, true, 12.0, 32.0, 0.5),
             ItemPose::Using
         ));
     }
