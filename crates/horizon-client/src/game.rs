@@ -1653,6 +1653,7 @@ struct Game<'a> {
     /// `screenshot-sequence` while it runs.
     screenshot_sequence: Option<screenshot_sequence::Sequence>,
     export: Option<export::Session>,
+    native_export: native_export::NativeExport,
     visual_offset: i64,
     /// `render-capture DIR`: replied once the renderer wrote the scene.
     pending_render_capture: Option<std::sync::mpsc::Sender<String>>,
@@ -4817,6 +4818,15 @@ impl Game<'_> {
                 if spectator {
                     g.draw_spectator_hotbar(batch);
                 } else {
+                    let attack = (indicator == 2).then(|| {
+                        let mut progress = strength;
+                        g.native_hotbar_attack_indicator_progress(&mut progress);
+                        if (0.0..=1.0).contains(&progress) {
+                            progress
+                        } else {
+                            strength
+                        }
+                    });
                     let partial = g.clock.fraction() as f32;
                     let inputs = hud_layout::HotbarInputs {
                         selected: g.selected as i32,
@@ -4828,7 +4838,7 @@ impl Game<'_> {
                                 .map(|_| (f32::from(g.hotbar_pop[i]) - partial).max(0.0))
                         }),
                         offhand_pop: (f32::from(g.hotbar_pop[9]) - partial).max(0.0),
-                        attack: (indicator == 2).then_some(strength),
+                        attack,
                     };
                     let draws = hud_layout::hotbar(wi, hi, &inputs);
                     hud_layout::paint(batch, &g.gui.atlas, &draws);
@@ -10920,6 +10930,7 @@ impl<'a> Game<'a> {
             pending_screenshot: None,
             screenshot_sequence: None,
             export: None,
+            native_export: native_export::NativeExport::default(),
             visual_offset: 0,
             pending_render_capture: None,
             pending_bench: None,
