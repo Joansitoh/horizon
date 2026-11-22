@@ -467,6 +467,12 @@ impl Game<'_> {
     /// `init_remote_for_replay` makes anew), back as a fresh open has it, so the world rebuilt
     /// from the start shows only what the packets replayed set.
     fn reset_replay_world_extras(&mut self) {
+        // A new LocalPlayer holds nothing (vanilla's handleLogin): the snapshot sends only the
+        // slots that were full, so an item the replaced session held must not stay in an empty
+        // slot.
+        self.inventory = vec![None; 36];
+        self.offhand = None;
+        self.armor = [None, None, None, None];
         self.border = Default::default();
         self.tab_list = Default::default();
         self.score.board = Default::default();
