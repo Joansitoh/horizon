@@ -223,6 +223,26 @@ pub mod built {
             ended,
         }
     }
+    /// A saved recording as `recordings` lists it, constructed by the game and only read by mods.
+    pub fn recording_info(
+        id: String,
+        name: String,
+        duration_ms: u32,
+        [size, date]: [u64; 2],
+        [server, version]: [String; 2],
+        singleplayer: bool,
+    ) -> crate::RecordingInfo {
+        crate::RecordingInfo {
+            id,
+            name,
+            duration_ms,
+            size,
+            date,
+            server,
+            version,
+            singleplayer,
+        }
+    }
     /// Wrap a slot in the persistent instance group store.
     pub fn instance_group_ref(generation: u64, slot: u32) -> crate::InstanceGroupRef {
         crate::InstanceGroupRef::from_parts(generation, slot).expect("published group generation")
