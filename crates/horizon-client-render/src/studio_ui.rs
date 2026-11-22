@@ -149,9 +149,18 @@ impl StudioUi {
     pub fn read_metadata(path: &Path) -> Option<RecordingMetadata> {
         let file = File::open(path).ok()?;
         let mut archive = zip::ZipArchive::new(file).ok()?;
-        let mut meta_file = archive.by_name("metaData.json").ok()?;
+        let meta_file = archive.by_name("metaData.json").ok()?;
+        // A real metadata file is a few hundred bytes: read one byte past the cap and treat an
+        // entry over it as unreadable instead of loading it whole.
+        const MAX_METADATA_BYTES: u64 = 1024 * 1024;
         let mut meta_bytes = Vec::new();
-        meta_file.read_to_end(&mut meta_bytes).ok()?;
+        meta_file
+            .take(MAX_METADATA_BYTES + 1)
+            .read_to_end(&mut meta_bytes)
+            .ok()?;
+        if meta_bytes.len() as u64 > MAX_METADATA_BYTES {
+            return None;
+        }
         serde_json::from_slice(&meta_bytes).ok()
     }
 

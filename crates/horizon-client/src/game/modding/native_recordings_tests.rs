@@ -46,6 +46,8 @@ fn the_list_holds_the_recordings_an_id_can_open_newest_first() {
     std::fs::write(dir.join("notes.txt"), b"x").unwrap();
     std::fs::write(dir.join("trip.mcpr.tmp"), b"x").unwrap();
     std::fs::create_dir(dir.join("folder.mcpr")).unwrap();
+    // A drive prefix makes `Path::join` drop `dir` on Windows, so this name is Unix-only.
+    #[cfg(unix)]
     std::fs::write(dir.join("a:b.mcpr"), b"x").unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(dir.join("new_trip.mcpr"), dir.join("linked.mcpr")).unwrap();
