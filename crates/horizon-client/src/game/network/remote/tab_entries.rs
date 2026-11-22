@@ -27,20 +27,26 @@ impl Remote {
         if name.is_empty() {
             return None;
         }
-        // The server's textures for them, else the account's own (single player sends none).
+        // The textures live rendering draws on them (`update_remote_skins`): the server's, with
+        // the account's own filling the skin or cape the server names none of. The launcher's
+        // offline skin and cape are images with no URL to keep.
         let account = match &self.own_profile {
             OwnProfile::Done(Some(t)) => Some(t),
             _ => None,
         };
-        let textures = self
-            .skin_textures
-            .get(&self.profile)
-            .filter(|t| t.skin.is_some())
-            .or(account);
+        let textures = match (self.skin_textures.get(&self.profile), account) {
+            (Some(server), Some(account)) => {
+                let mut textures = server.clone();
+                super::skins::fill_from_account(&mut textures, account);
+                Some(textures)
+            }
+            (Some(textures), None) | (None, Some(textures)) => Some(textures.clone()),
+            (None, None) => None,
+        };
         Some(horizon_client::studio::recorder::recorder_entry(
             name,
             self.game_mode,
-            textures,
+            textures.as_ref(),
         ))
     }
 }
