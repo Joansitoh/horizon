@@ -21,6 +21,10 @@ struct Entity {
     /// The `AddEntity` that created it, with the position, rotation, head rotation and motion
     /// kept at their latest values.
     add: AddEntity,
+    /// The position codec's base (`Entity.getPositionCodec`): where the server last reported the
+    /// entity (`AddEntity`, a move, a position sync), which the next move's delta counts from. A
+    /// teleport or a minecart step moves `add.position` but not this.
+    base: [f64; 3],
     /// Its synched data by entry index.
     data: Vec<(u8, i32, Value)>,
     /// Its worn and held items by `EquipmentSlot` ordinal.
@@ -48,6 +52,7 @@ impl EntityMirror {
                     p.id,
                     Entity {
                         add: p.clone(),
+                        base: p.position,
                         data: Vec::new(),
                         equipment: Vec::new(),
                         leash_holder: None,
@@ -64,6 +69,8 @@ impl EntityMirror {
                 if let Some(entity) = self.entities.get_mut(id) {
                     for value in values {
                         match entity.data.iter_mut().find(|(index, ..)| *index == value.0) {
+                            // An update that says what is held already costs nothing.
+                            Some(held) if *held == *value => {}
                             Some(held) => *held = value.clone(),
                             None => entity.data.push(value.clone()),
                         }
@@ -74,6 +81,7 @@ impl EntityMirror {
                 if let Some(entity) = self.entities.get_mut(id) {
                     for slot in slots {
                         match entity.equipment.iter_mut().find(|(s, _)| *s == slot.0) {
+                            Some(held) if *held == *slot => {}
                             Some(held) => *held = slot.clone(),
                             None => entity.equipment.push(slot.clone()),
                         }
@@ -95,7 +103,10 @@ impl EntityMirror {
             | C::MoveEntityRot(play::MoveEntityRot(m)) => {
                 if let Some(entity) = self.entities.get_mut(&m.id) {
                     if let Some(delta) = &m.delta {
-                        entity.add.position = delta.end(entity.add.position);
+                        // handleMoveEntity: the delta counts from the codec's base, which
+                        // then moves to the delta's end, and the entity with it.
+                        entity.base = delta.end(entity.base);
+                        entity.add.position = entity.base;
                     }
                     if let Some((yaw, pitch)) = m.rotation {
                         entity.add.yaw = yaw;
@@ -105,7 +116,8 @@ impl EntityMirror {
             }
             C::EntityPositionSync(p) => {
                 if let Some(entity) = self.entities.get_mut(&p.id) {
-                    entity.add.position = p.path.end();
+                    entity.base = p.path.end();
+                    entity.add.position = entity.base;
                     entity.add.yaw = pack_degrees(p.yaw);
                     entity.add.pitch = pack_degrees(p.pitch);
                 }
@@ -149,6 +161,16 @@ impl EntityMirror {
                     entity.add.pitch = angle(play::relative::X_ROT, entity.add.pitch, p.pitch);
                 }
             }
+            // The steps carry absolute positions: the cart is where the last one puts it. The
+            // codec base stays where the server last reported it.
+            C::MoveMinecartAlongTrack(p) => {
+                if let (Some(entity), Some(step)) = (self.entities.get_mut(&p.id), p.steps.last()) {
+                    entity.add.position = step.position;
+                    entity.add.velocity = step.movement;
+                    entity.add.yaw = step.yaw;
+                    entity.add.pitch = step.pitch;
+                }
+            }
             C::SetPassengers(SetPassengers {
                 vehicle,
                 passengers,
@@ -180,15 +202,37 @@ impl EntityMirror {
         self.entities.is_empty()
     }
 
-    /// The packets that show the entities as they stand: every `AddEntity` first (by id), then
-    /// their data, equipment, leads and riders, which need the entities to exist.
+    /// The packets that show the entities as they stand: every `AddEntity` first (by id), at
+    /// the position codec's base, then a teleport for each one that stands elsewhere (a
+    /// teleport moves the entity, not the base, so the next move still lands where the server
+    /// means), then their data, equipment, leads and riders, which need the entities to exist.
     pub fn packets(&self) -> Vec<C> {
         let mut ids: Vec<i32> = self.entities.keys().copied().collect();
         ids.sort_unstable();
         let mut out: Vec<C> = ids
             .iter()
-            .map(|id| C::AddEntity(self.entities[id].add.clone()))
+            .map(|id| {
+                let entity = &self.entities[id];
+                C::AddEntity(AddEntity {
+                    position: entity.base,
+                    ..entity.add.clone()
+                })
+            })
             .collect();
+        for id in &ids {
+            let entity = &self.entities[id];
+            if entity.add.position != entity.base {
+                out.push(C::TeleportEntity(play::TeleportEntity {
+                    id: *id,
+                    position: entity.add.position,
+                    delta: entity.add.velocity,
+                    yaw: unpack_degrees(entity.add.yaw),
+                    pitch: unpack_degrees(entity.add.pitch),
+                    relatives: 0,
+                    on_ground: false,
+                }));
+            }
+        }
         for id in &ids {
             let entity = &self.entities[id];
             if !entity.data.is_empty() {
@@ -365,12 +409,70 @@ mod tests {
             (two.yaw, two.pitch),
             (pack_degrees(90.0), pack_degrees(45.0))
         );
+        // Teleports move the entity, not its codec base: it is added where the base is and
+        // teleported to where it stands.
         let three = added(&packets, 3);
-        assert_eq!(three.position, [6.0, 100.0, 3.0]);
+        assert_eq!(three.position, [5.0, 5.0, 5.0]);
+        assert!(packets.iter().any(|p| matches!(p,
+            C::TeleportEntity(t) if t.id == 3 && t.position == [6.0, 100.0, 3.0]
+                && t.delta == [0.0, 0.75, 0.0] && t.relatives == 0)));
         assert_eq!(three.yaw, pack_degrees(180.0));
         assert_eq!(three.pitch, pack_degrees(10.0));
         // The first teleport set the motion; the second added to it.
         assert_eq!(three.velocity, [0.0, 0.75, 0.0]);
+    }
+
+    #[test]
+    fn a_recording_started_after_a_teleport_keeps_the_codec_base() {
+        let relative_move = C::MoveEntityPos(play::MoveEntityPos(MoveEntity {
+            id: 1,
+            delta: Some(VecDelta::Linear([4096, 0, 0])),
+            rotation: None,
+            on_ground: true,
+        }));
+        let mut live = EntityMirror::default();
+        live.apply(&add(1, [10.0, 64.0, 10.0]));
+        live.apply(&C::TeleportEntity(TeleportEntity {
+            id: 1,
+            position: [100.0, 64.0, 10.0],
+            delta: [0.0; 3],
+            yaw: 0.0,
+            pitch: 0.0,
+            relatives: 0,
+            on_ground: false,
+        }));
+        // What a replay holds after the snapshot of this moment.
+        let mut replay = EntityMirror::default();
+        for packet in live.packets() {
+            replay.apply(&packet);
+        }
+        // The server's next delta counts from where it last reported the entity: x = 10.
+        live.apply(&relative_move);
+        replay.apply(&relative_move);
+        assert_eq!(added(&live.packets(), 1).position, [11.0, 64.0, 10.0]);
+        assert_eq!(added(&replay.packets(), 1).position, [11.0, 64.0, 10.0]);
+    }
+
+    #[test]
+    fn a_minecart_is_where_its_last_step_put_it() {
+        let step = |x: f64| play::MinecartStep {
+            position: [x, 64.0, 0.0],
+            movement: [0.25, 0.0, 0.0],
+            yaw: 16,
+            pitch: 4,
+            weight: 1.0,
+        };
+        let mut mirror = EntityMirror::default();
+        mirror.apply(&add(1, [0.0, 64.0, 0.0]));
+        mirror.apply(&C::MoveMinecartAlongTrack(play::MoveMinecartAlongTrack {
+            id: 1,
+            steps: vec![step(1.0), step(2.5)],
+        }));
+        let packets = mirror.packets();
+        assert!(packets.iter().any(|p| matches!(p,
+            C::TeleportEntity(t) if t.id == 1 && t.position == [2.5, 64.0, 0.0]
+                && t.delta == [0.25, 0.0, 0.0])));
+        assert_eq!(added(&packets, 1).position, [0.0, 64.0, 0.0]);
     }
 
     #[test]

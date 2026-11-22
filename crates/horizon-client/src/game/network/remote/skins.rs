@@ -130,20 +130,33 @@ impl Game<'_> {
         if name.is_empty() {
             return None;
         }
-        // The server's textures for them, else the account's own (single player sends none).
+        // The textures live rendering draws on them (`update_remote_skins`): the server's, with
+        // the account's own filling the skin or cape the server names none of.
         let account = match &r.own_profile {
             OwnProfile::Done(Some(t)) => Some(t),
             _ => None,
         };
-        let textures = r
-            .skin_textures
-            .get(&r.profile)
-            .filter(|t| t.skin.is_some())
-            .or(account);
+        let textures = match (r.skin_textures.get(&r.profile), account) {
+            (Some(server), Some(account)) => {
+                let mut textures = server.clone();
+                if textures.skin.is_none() {
+                    textures.skin = account.skin.clone();
+                    if account.skin.is_some() {
+                        textures.slim = account.slim;
+                    }
+                }
+                if textures.cape.is_none() {
+                    textures.cape = account.cape.clone();
+                }
+                Some(textures)
+            }
+            (Some(textures), None) | (None, Some(textures)) => Some(textures.clone()),
+            (None, None) => None,
+        };
         Some(horizon_client::studio::recorder::recorder_entry(
             name,
             r.game_mode,
-            textures,
+            textures.as_ref(),
         ))
     }
     pub(super) fn poll_own_profile_body(&mut self) {

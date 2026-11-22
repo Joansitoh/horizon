@@ -237,7 +237,22 @@ impl StudioRecorder {
         let mut reader = Reader::new(&encoded);
         let Ok(id) = reader.varint() else { return };
         if let Some((id, payload)) = recordable(packet, id, reader.rest(), self.own_player) {
-            self.record_packet_at(timestamp_ms, id, &payload);
+            self.record_baseline_at(timestamp_ms, id, &payload);
+        }
+    }
+
+    /// Record a packet of the baseline a recording opens with, at an explicit timestamp. Unlike
+    /// a live packet it waits for room when the writer's queue is full: a snapshot of chunks and
+    /// entities is far more than the queue holds, and capture must not end half way through it.
+    /// Only a writer that has gone ends it.
+    pub fn record_baseline_at(&self, timestamp_ms: u32, id: i32, payload: &[u8]) {
+        if !self.active.load(Ordering::Relaxed) {
+            return;
+        }
+        let pkt = TimestampedPacket::new(timestamp_ms, id, payload.to_vec());
+        if self.sender.send(RecordCommand::Packet(pkt)).is_err() {
+            *self.failure.lock().unwrap() = Some("recorder worker stopped unexpectedly".into());
+            self.active.store(false, Ordering::SeqCst);
         }
     }
 
@@ -758,6 +773,39 @@ mod tests {
                 assert_eq!(recorder.status().packet_count, 0);
             }
         }
+    }
+
+    #[test]
+    fn a_baseline_waits_for_the_writer_instead_of_ending_capture() {
+        let (sender, receiver) = sync_channel(1);
+        let recorder = StudioRecorder {
+            active: Arc::new(AtomicBool::new(true)),
+            packet_count: Arc::new(AtomicU64::new(0)),
+            bytes_written: Arc::new(AtomicU64::new(0)),
+            sender,
+            failure: Arc::new(std::sync::Mutex::new(None)),
+            worker: None,
+            start_time: Instant::now(),
+            dest_path: PathBuf::from("unused.mcpr"),
+            own_player: None,
+        };
+        let writer = std::thread::spawn(move || {
+            let mut packets = 0;
+            while let Ok(RecordCommand::Packet(_)) = receiver.recv() {
+                packets += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            packets
+        });
+        for i in 0..50u8 {
+            recorder.record_baseline_at(0, 1, &[i]);
+        }
+        let status = recorder.status();
+        assert!(status.active);
+        assert_eq!(status.error, None);
+        // Dropping sends the writer its Stop.
+        drop(recorder);
+        assert_eq!(writer.join().unwrap(), 50);
     }
 
     #[test]

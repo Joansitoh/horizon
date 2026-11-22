@@ -808,6 +808,18 @@ impl Game<'_> {
                 r.session.start_recording(recorder, |recorder| {
                     self.dump_world_snapshot_to_recorder(recorder);
                 });
+                // A writer that gave out during the baseline leaves a recording without its
+                // opening: it does not start.
+                if let Some(error) = r
+                    .session
+                    .recorder_status()
+                    .filter(|status| !status.active)
+                    .and_then(|status| status.error)
+                {
+                    let _ = r.session.stop_recording();
+                    let _ = std::fs::remove_file(&path);
+                    return Ok(json!({ "ok": false, "error": error }));
+                }
                 Ok(json!({ "ok": true, "path": path.display().to_string() }))
             }
             Err(e) => Ok(json!({ "ok": false, "error": e.to_string() })),
@@ -1136,7 +1148,7 @@ impl Game<'_> {
             let mut reader = horizon_protocol::buf::Reader::new(&encoded);
             if let Ok(id) = reader.varint() {
                 let payload = reader.rest();
-                recorder.record_packet_at(0, id, payload);
+                recorder.record_baseline_at(0, id, payload);
             }
         };
 
