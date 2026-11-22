@@ -29,7 +29,8 @@ pub trait RecordingClientHost {
     /// the recordings folder when this answers. Answers the recording's id, as `replay_open` takes
     /// it (empty for a recording started by `/studio record start` under a name no id can hold).
     /// The archive is written on the game's thread before this answers, so a long recording takes a moment.
-    /// `NotRecording` while no recording runs, `NotConnected` with no world session,
+    /// `NotRecording` while no recording runs, `NotConnected` with no world session or, when no
+    /// recording runs, while a replay plays (as `recording_start` answers during a replay),
     /// `DiskError` when the recording had failed or its archive could not be finished.
     #[access(WorldOnly)]
     fn recording_stop(&mut self) -> Result<String, RecordingError>;

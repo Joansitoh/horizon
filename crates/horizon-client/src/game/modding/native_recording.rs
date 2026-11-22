@@ -76,6 +76,8 @@ impl Game<'_> {
                 log::warn!("A mod's recording ended with an error: {error}");
                 Err(RecordingError::DiskError)
             }
+            // A replay plays no recorder (checked first, so a running recorder stays stoppable).
+            None if self.replay.playing() => Err(RecordingError::NotConnected),
             None => Err(RecordingError::NotRecording),
         }
     }

@@ -12,7 +12,7 @@ use horizon_client::{
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 /// A recorded `PlayerPosition` that moves the local player relative to where it is (a rotation
@@ -803,14 +803,9 @@ impl Game<'_> {
     }
 
     pub(super) fn start_studio_recording(&mut self, name: Option<&str>) -> Result<Value> {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let filename = match name {
-            Some(n) if !n.is_empty() => format!("{}_{}.mcpr", n, ts),
-            _ => format!("recording_{}.mcpr", ts),
-        };
+        // The typed name is only a prefix: the generator keeps letters, digits, `-` and `_`, so
+        // `../trip` can never leave the recordings folder.
+        let filename = horizon_client::studio::generate_recording_filename(name);
         let dir = self.recordings_dir();
         match self.begin_studio_recording(&dir, &filename) {
             Ok(path) => Ok(json!({ "ok": true, "path": path.display().to_string() })),
