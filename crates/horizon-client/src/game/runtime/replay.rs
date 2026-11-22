@@ -110,6 +110,26 @@ impl Replay {
     }
 }
 
+/// Why `begin_studio_recording` started nothing.
+pub(super) enum StudioRecordError {
+    /// No world session to record.
+    NoSession,
+    /// A recording is already running.
+    Active,
+    /// The recording's file could not be created.
+    Disk(std::io::Error),
+}
+
+impl std::fmt::Display for StudioRecordError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSession => f.write_str("no active world session"),
+            Self::Active => f.write_str("recording already active"),
+            Self::Disk(error) => write!(f, "{error}"),
+        }
+    }
+}
+
 impl Game<'_> {
     /// How far the window's own player model is between two ticks: on the replay's clock while a
     /// replay plays, else the game's.
@@ -769,13 +789,6 @@ impl Game<'_> {
     }
 
     pub(super) fn start_studio_recording(&mut self, name: Option<&str>) -> Result<Value> {
-        let Some(r) = self.remote.as_ref() else {
-            return Ok(json!({ "ok": false, "error": "no active world session" }));
-        };
-        if r.session.is_recording() {
-            return Ok(json!({ "ok": false, "error": "recording already active" }));
-        }
-        let _ = std::fs::create_dir_all("recordings");
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -784,7 +797,29 @@ impl Game<'_> {
             Some(n) if !n.is_empty() => format!("{}_{}.mcpr", n, ts),
             _ => format!("recording_{}.mcpr", ts),
         };
-        let path = PathBuf::from("recordings").join(filename);
+        let dir = self.recordings_dir();
+        match self.begin_studio_recording(&dir, &filename) {
+            Ok(path) => Ok(json!({ "ok": true, "path": path.display().to_string() })),
+            Err(error) => Ok(json!({ "ok": false, "error": error.to_string() })),
+        }
+    }
+
+    /// Starts recording the session's packets into `dir/file_name`, the one way `/studio record`
+    /// and a mod's `recording_start` begin: the world's snapshot first, then what the session
+    /// receives. The file appears when the recording ends.
+    pub(super) fn begin_studio_recording(
+        &mut self,
+        dir: &Path,
+        file_name: &str,
+    ) -> std::result::Result<PathBuf, StudioRecordError> {
+        let Some(r) = self.remote.as_ref() else {
+            return Err(StudioRecordError::NoSession);
+        };
+        if r.session.is_recording() {
+            return Err(StudioRecordError::Active);
+        }
+        let _ = std::fs::create_dir_all(dir);
+        let path = dir.join(file_name);
         let server_address = if r.session.address.is_empty() {
             "local".to_owned()
         } else {
@@ -802,9 +837,9 @@ impl Game<'_> {
                 r.session.start_recording(recorder, |recorder| {
                     self.dump_world_snapshot_to_recorder(recorder);
                 });
-                Ok(json!({ "ok": true, "path": path.display().to_string() }))
+                Ok(path)
             }
-            Err(e) => Ok(json!({ "ok": false, "error": e.to_string() })),
+            Err(error) => Err(StudioRecordError::Disk(error)),
         }
     }
 
