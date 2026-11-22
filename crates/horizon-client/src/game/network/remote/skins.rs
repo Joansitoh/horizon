@@ -119,11 +119,11 @@ impl Game<'_> {
     pub(super) fn poll_own_profile_body(&mut self) {
         // A standalone replay shows the recording's textures: the viewing account's profile is
         // not fetched for it.
-        let replay = self
-            .remote
-            .as_ref()
-            .is_some_and(|r| r.brand == REPLAY_BRAND);
-        let auth = if replay { None } else { self.auth() };
+        let auth = if self.replay.standalone {
+            None
+        } else {
+            self.auth()
+        };
         let Some(r) = self.remote.as_mut() else {
             return;
         };
@@ -190,14 +190,15 @@ impl Game<'_> {
 
     pub(super) fn update_remote_skins_body(&mut self) {
         let local = self.remote.as_ref().map(|r| r.profile);
+        // The standalone replay's own session: its player wears what the recording kept, not
+        // the viewing account's skin and cape or the launcher's offline ones. (The session's
+        // brand is no marker: a server names its own.)
+        let replay = self.replay.standalone;
         self.poll_own_profile();
         let Some(r) = self.remote.as_mut() else {
             return;
         };
         let local = local.unwrap_or(r.profile);
-        // The standalone replay's own session: its player wears what the recording kept, not
-        // the viewing account's skin and cape or the launcher's offline ones.
-        let replay = r.brand == REPLAY_BRAND;
         let mut entries = skin_entries(
             &r.level_players,
             &r.skin_textures,
@@ -487,9 +488,6 @@ impl Game<'_> {
         comp_text(&chat_type_decorate(chat_type, decoration, bound, content))
     }
 }
-
-/// The brand of a standalone replay's synthetic session (`Remote::brand`).
-pub(super) const REPLAY_BRAND: &str = "horizon-studio";
 
 /// `Minecraft.profileFuture`: where the server's textures for the local player name no skin
 /// (single player sends none) or no cape, the signed-in account's own fill them in, the skin
