@@ -473,6 +473,8 @@ impl Game<'_> {
         self.inventory = vec![None; 36];
         self.offhand = None;
         self.armor = [None, None, None, None];
+        // The snapshot says weather only when there is a storm, and a Login keeps the world's.
+        self.world.weather = Default::default();
         self.border = Default::default();
         self.tab_list = Default::default();
         self.score.board = Default::default();
