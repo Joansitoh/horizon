@@ -18,6 +18,10 @@ use horizon_protocol::{
 /// Present (with an empty body) when the session confirmed Horizon's native component
 /// registry (`Dynamic::custom_components`), which no vanilla packet carries.
 const CUSTOM_COMPONENTS_CHANNEL: &str = "horizon:custom_components";
+/// Present, with the revision as its one byte, when the session agreed a `horizon:menu_extra`
+/// layout newer than the legacy one (`Dynamic::menu_extra_revision`): the play stream's menu
+/// extras are decoded by it.
+const MENU_EXTRA_REVISION_CHANNEL: &str = "horizon:menu_extra_revision";
 
 /// The configuration packets that rebuild `registries`, in the order a server sends them:
 /// every registry (sorted by name, entries in id order), then the tags.
@@ -32,6 +36,12 @@ pub fn packets(registries: &Dynamic) -> Vec<TimestampedPacket> {
         sent.push(C::CustomPayload(CustomPayload {
             channel: CUSTOM_COMPONENTS_CHANNEL.into(),
             data: Vec::new(),
+        }));
+    }
+    if registries.menu_extra_revision != 0 {
+        sent.push(C::CustomPayload(CustomPayload {
+            channel: MENU_EXTRA_REVISION_CHANNEL.into(),
+            data: vec![registries.menu_extra_revision],
         }));
     }
     let mut names: Vec<&String> = registries.registries.keys().collect();
@@ -99,6 +109,9 @@ pub fn registries(packets: &[TimestampedPacket]) -> Option<Dynamic> {
             Ok(C::CustomPayload(payload)) if payload.channel == CUSTOM_COMPONENTS_CHANNEL => {
                 dynamic.custom_components = true;
             }
+            Ok(C::CustomPayload(payload)) if payload.channel == MENU_EXTRA_REVISION_CHANNEL => {
+                dynamic.menu_extra_revision = payload.data.first().copied().unwrap_or(0);
+            }
             Ok(_) => {}
             Err(error) => log::debug!(
                 "Studio replay skipped configuration packet {:#x}: {error}",
@@ -156,6 +169,7 @@ mod tests {
             }],
         });
         dynamic.custom_components = true;
+        dynamic.menu_extra_revision = 1;
         dynamic
     }
 
@@ -191,6 +205,7 @@ mod tests {
             Some(&[5, 9, 300][..])
         );
         assert!(played.custom_components);
+        assert_eq!(played.menu_extra_revision, 1);
     }
 
     #[test]
