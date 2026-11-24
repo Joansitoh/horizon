@@ -14,22 +14,14 @@ use horizon_protocol::{
 const RAIN_LEVEL_CHANGE: u8 = 7;
 const THUNDER_LEVEL_CHANGE: u8 = 8;
 
-/// The world clock the level's day time follows.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Clock {
-    /// Its id in the `minecraft:world_clock` registry.
-    pub id: i32,
-    pub rate: f32,
-    pub partial_tick: f32,
-}
-
 /// What the session holds for the recording player, as the client knows it.
 #[derive(Clone, Debug, Default)]
 pub struct SessionState {
     pub game_time: i64,
-    pub day_time: i64,
-    /// The level's clock; `None` before the server named one (no day time to send).
-    pub clock: Option<Clock>,
+    /// The connection's world clocks (`ClientClockManager`): total ticks, partial tick and rate
+    /// by `minecraft:world_clock` registry id. The level's day time is its default clock's total;
+    /// empty before the server sent any.
+    pub clocks: Vec<ClockState>,
     pub rain_level: f32,
     pub thunder_level: f32,
     /// Health, food and saturation.
@@ -48,16 +40,7 @@ pub struct SessionState {
 pub fn packets(state: &SessionState) -> Vec<C> {
     let mut out = vec![C::SetTime(SetTime {
         game_time: state.game_time,
-        clocks: state
-            .clock
-            .map(|clock| ClockState {
-                clock: clock.id,
-                total_ticks: state.day_time,
-                partial_tick: clock.partial_tick,
-                rate: clock.rate,
-            })
-            .into_iter()
-            .collect(),
+        clocks: state.clocks.clone(),
     })];
     // A level starts clear: only a storm needs saying.
     for (event, level) in [
@@ -102,12 +85,20 @@ mod tests {
     fn state() -> SessionState {
         SessionState {
             game_time: 123_456,
-            day_time: 18_000,
-            clock: Some(Clock {
-                id: 3,
-                rate: 1.0,
-                partial_tick: 0.25,
-            }),
+            clocks: vec![
+                ClockState {
+                    clock: 0,
+                    total_ticks: 18_000,
+                    partial_tick: 0.25,
+                    rate: 1.0,
+                },
+                ClockState {
+                    clock: 1,
+                    total_ticks: 6_000,
+                    partial_tick: 0.0,
+                    rate: 0.5,
+                },
+            ],
             rain_level: 0.0,
             thunder_level: 0.0,
             health: (13.5, 17, 2.0),
@@ -128,10 +119,14 @@ mod tests {
             })
             .expect("time");
         assert_eq!(time.game_time, 123_456);
-        assert_eq!(time.clocks.len(), 1);
+        // Both clocks, with their own totals, partial ticks and rates.
+        assert_eq!(time.clocks, state().clocks);
         assert_eq!(
-            (time.clocks[0].clock, time.clocks[0].total_ticks),
-            (3, 18_000)
+            time.clocks
+                .iter()
+                .map(|c| (c.clock, c.total_ticks, c.partial_tick, c.rate))
+                .collect::<Vec<_>>(),
+            [(0, 18_000, 0.25, 1.0), (1, 6_000, 0.0, 0.5)]
         );
         // Nothing to say about weather while it is clear.
         assert!(!packets.iter().any(|p| matches!(p, C::GameEvent(_))));
@@ -174,7 +169,7 @@ mod tests {
     #[test]
     fn a_level_without_a_clock_sends_no_day_time() {
         let mut unclocked = state();
-        unclocked.clock = None;
+        unclocked.clocks.clear();
         let packets = packets(&unclocked);
         assert!(
             packets.iter().any(

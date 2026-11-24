@@ -60,12 +60,6 @@ pub(super) struct Replay {
     /// `connections` when the replay playing took up its session: a replay whose session has
     /// gone since is no longer playing on the one there now.
     pub(super) connection: u64,
-    /// The archive a mod's replay was opened from (`replay_open`): the editor saves its markers
-    /// and camera path only into that very file, never into one put in its place since.
-    pub(super) archive: Option<super::native_replay::FileIdentity>,
-    /// The archive file the replay playing read (any route), refreshed from the file each
-    /// editor save writes: what a mod's reopen of it is compared with, without opening it.
-    pub(super) identity: Option<super::native_replay::FileIdentity>,
     /// A seek was applied: the next frame reports its position (`replay_advanced`) and holds the
     /// clock there, so the frame drawn shows exactly where the seek went.
     pub(super) seek_report: bool,
@@ -76,6 +70,10 @@ pub(super) struct Replay {
 impl Replay {
     pub(super) fn export_driver(&self) -> Option<&ReplayDriver> {
         self.driver.as_ref()?.as_any().downcast_ref()
+    }
+
+    pub(super) fn edit_driver(&mut self) -> Option<&mut ReplayDriver> {
+        self.driver.as_mut()?.as_any_mut().downcast_mut()
     }
 
     pub(super) fn take_replaced_recording(
@@ -481,6 +479,14 @@ impl Game<'_> {
     /// `init_remote_for_replay` makes anew), back as a fresh open has it, so the world rebuilt
     /// from the start shows only what the packets replayed set.
     fn reset_replay_world_extras(&mut self) {
+        // A new LocalPlayer holds nothing (vanilla's handleLogin): the snapshot sends only the
+        // slots that were full, so an item the replaced session held must not stay in an empty
+        // slot.
+        self.inventory = vec![None; 36];
+        self.offhand = None;
+        self.armor = [None, None, None, None];
+        // The snapshot says weather only when there is a storm, and a Login keeps the world's.
+        self.world.weather = Default::default();
         self.border = Default::default();
         self.tab_list = Default::default();
         self.score.board = Default::default();
@@ -816,9 +822,9 @@ impl Game<'_> {
         );
         match horizon_client::studio::StudioRecorder::start(path.clone(), meta) {
             Ok(recorder) => {
+                self.replay.recording_error_reported = false;
                 // Their own tab entry (the skin) stays in the recording; everyone else's stays out.
                 let recorder = recorder.with_own_player(r.profile);
-                self.replay.recording_error_reported = false;
                 r.session.start_recording(recorder, |recorder| {
                     self.dump_world_snapshot_to_recorder(recorder);
                 });
@@ -904,12 +910,7 @@ impl Game<'_> {
 
         // Validate and index the archive before replacing the title menu or active world. A
         // temp-file, metadata, or protocol error must leave the current screen usable.
-        // The archive is read through one handle, which also says which file it is.
-        let opened = std::fs::File::open(path).and_then(|file| {
-            let identity = super::native_replay::FileIdentity::of(&file).ok();
-            Ok((ReplayDriver::from_file(file, Path::new(path))?, identity))
-        });
-        let (driver, identity) = match opened {
+        let driver = match ReplayDriver::open(Path::new(path)) {
             Ok(opened) => opened,
             Err(error) => {
                 log::error!("Failed to open studio replay '{path}': {error}");
@@ -921,7 +922,6 @@ impl Game<'_> {
             recording: self.recording_id(path),
             request: 0,
             archive: None,
-            identity,
             replacing: None,
         };
         self.start_studio_replay(driver, origin, path)
@@ -937,11 +937,7 @@ impl Game<'_> {
         path: &str,
     ) -> Result<Value> {
         let super::native_replay::ReplayOrigin {
-            recording,
-            request,
-            archive,
-            identity,
-            ..
+            recording, request, ..
         } = origin;
         let mut driver = driver;
         // The first frame is set up from the opening snapshot before mods hear `replay_opened`,
@@ -981,10 +977,8 @@ impl Game<'_> {
             self.replay.previous_camera_type = Some(self.camera_type);
             self.replay.standalone = standalone;
         }
-        self.studio_replay_opened(&driver);
+        self.studio_replay_opened(&mut driver);
         self.replay.recording = recording.clone();
-        self.replay.archive = archive;
-        self.replay.identity = identity;
         self.replay.generation += 1;
         self.replay.reported_ms = None;
         self.replay.seek_report = false;
@@ -1078,8 +1072,6 @@ impl Game<'_> {
         self.replay.seek_report = false;
         // A part step of the wheel in the replay doesn't carry into the next session.
         self.mouse.scroll = Default::default();
-        self.replay.archive = None;
-        self.replay.identity = None;
         let recording = std::mem::take(&mut self.replay.recording);
         if heard {
             self.native_replay_closed(&recording);
@@ -1102,7 +1094,7 @@ impl Game<'_> {
         &self,
         r: &super::remote::Remote,
     ) -> horizon_client::studio::snapshot::SessionState {
-        use horizon_client::studio::snapshot::{Clock, SessionState};
+        use horizon_client::studio::snapshot::SessionState;
         let held = |slot: i32, stack: &Option<horizon_client::items::ItemStack>| {
             self.to_network(stack).map(|stack| (slot, stack))
         };
@@ -1122,15 +1114,13 @@ impl Game<'_> {
             .collect();
         SessionState {
             game_time: self.world.game_time,
-            day_time: self.world.day_time,
-            clock: r.default_clock.map(|id| {
-                let state = r.clocks.get(&id);
-                Clock {
-                    id,
-                    rate: state.map_or(1.0, |c| c.rate),
-                    partial_tick: state.map_or(0.0, |c| c.partial_tick),
-                }
-            }),
+            // Every clock the connection holds (`ClientClockManager`), each as the tick loop has
+            // advanced it; by id, so a snapshot of the same state is the same bytes.
+            clocks: {
+                let mut clocks: Vec<_> = r.clocks.values().cloned().collect();
+                clocks.sort_by_key(|clock| clock.clock);
+                clocks
+            },
             rain_level: self.world.weather.rain_level.1,
             thunder_level: self.world.weather.thunder_level.1,
             health: r.health,
@@ -1229,8 +1219,9 @@ impl Game<'_> {
         for packet in horizon_client::studio::snapshot::packets(&self.session_snapshot_state(r)) {
             record_cb(packet);
         }
+
         // 2c. The recording player's own tab entry, so the replay shows their skin.
-        if let Some(entry) = self.recorder_tab_entry() {
+        if let Some(entry) = self.remote.as_ref().and_then(|r| r.recorder_tab_entry()) {
             record_cb(entry);
         }
 
