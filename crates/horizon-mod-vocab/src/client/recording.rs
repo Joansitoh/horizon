@@ -15,7 +15,8 @@ pub struct RecordingStatus {
     /// The recording being written, as the id `replay_open` takes: its file name in the
     /// recordings folder without `.mcpr`. Empty while there is no recording, and for one no
     /// id can name (started by `/studio record start` with a name holding a character an id
-    /// refuses). The file itself appears when the recording ends.
+    /// refuses). The file itself appears when the recording ends. While `finalizing` and no
+    /// other recording runs, it names the recording being finished.
     pub recording: String,
     /// How long the recording has run, in ms, counting on after a failure. 0 with no recording.
     pub elapsed_ms: u64,
@@ -25,6 +26,11 @@ pub struct RecordingStatus {
     /// behind) and the recording has not been stopped since: `recording_stop` ends it and
     /// answers `DiskError`.
     pub failed: bool,
+    /// A recording `recording_stop` ended is still having its archive written in the
+    /// background: its file is not in the recordings folder yet, and `recording_start` answers
+    /// `Finalizing`. False once the archive is in place, or its writing failed (the game logs
+    /// that; the recording then has no file).
+    pub finalizing: bool,
 }
 
 /// Why a recording call changed nothing.
@@ -42,8 +48,12 @@ pub enum RecordingError {
     NotConnected,
     /// No recording is running to stop.
     NotRecording,
-    /// The recording's file could not be created, or written whole: `recording_start` could
-    /// not create it, or `recording_stop` found the recorder had failed or could not finish
-    /// the archive. The recording is over, and its file may be incomplete or missing.
+    /// The recording's file could not be created, or the recorder had failed by the time
+    /// `recording_stop` ended it. The recording is over, and its file may be incomplete or
+    /// missing.
     DiskError,
+    /// The archive of the recording `recording_stop` ended is still being written
+    /// (`RecordingStatus::finalizing`): `recording_start` changed nothing, try again once the
+    /// status no longer says so.
+    Finalizing,
 }

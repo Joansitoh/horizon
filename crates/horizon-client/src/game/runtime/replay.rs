@@ -65,6 +65,8 @@ pub(super) struct Replay {
     pub(super) seek_report: bool,
     /// The folder mods open recordings from by id; the game folder's `recordings/` when none.
     pub(super) recordings_dir: Option<PathBuf>,
+    /// The recording a mod's `recording_stop` ended, while its archive is being written.
+    pub(super) finalizing: Option<super::native_recording::Finalizing>,
 }
 
 impl Replay {

@@ -64,34 +64,60 @@ fn recorder_status(active: bool, path: &str, error: Option<&str>) -> RecorderSta
 /// recorder that stopped on an error; empty when no recording runs.
 #[test]
 fn the_status_says_what_the_recorder_says() {
-    let running = status_of(Some(&recorder_status(
-        true,
-        "recordings/trip_2026-11-22_10-00-00_123_4.mcpr",
+    let running = status_of(
+        Some(&recorder_status(
+            true,
+            "recordings/trip_2026-11-22_10-00-00_123_4.mcpr",
+            None,
+        )),
         None,
-    )));
+    );
     assert!(running.active && !running.failed);
     assert_eq!(running.recording, "trip_2026-11-22_10-00-00_123_4");
     assert_eq!((running.elapsed_ms, running.bytes), (2_500, 4_096));
 
-    let failed = status_of(Some(&recorder_status(
-        false,
-        "recordings/trip.mcpr",
-        Some("recorder queue is full; capture stopped"),
-    )));
+    let failed = status_of(
+        Some(&recorder_status(
+            false,
+            "recordings/trip.mcpr",
+            Some("recorder queue is full; capture stopped"),
+        )),
+        None,
+    );
     assert!(!failed.active && failed.failed);
     assert_eq!(failed.recording, "trip");
 
     // A name no id can hold (`/studio record start` takes any word): no id, still a recording.
-    let odd = status_of(Some(&recorder_status(true, "recordings/a:b_1.mcpr", None)));
+    let odd = status_of(
+        Some(&recorder_status(true, "recordings/a:b_1.mcpr", None)),
+        None,
+    );
     assert!(odd.active);
     assert_eq!(odd.recording, "");
 
-    let none = status_of(None);
-    assert!(!none.active && !none.failed);
+    let none = status_of(None, None);
+    assert!(!none.active && !none.failed && !none.finalizing);
     assert_eq!(
         (none.recording.as_str(), none.elapsed_ms, none.bytes),
         ("", 0, 0)
     );
+}
+
+/// An archive being written after `recording_stop` shows as `finalizing`, under its id while no
+/// other recording runs; beside a running one the status is that recording's.
+#[test]
+fn the_status_says_while_an_archive_is_being_finalized() {
+    let finalizing = status_of(None, Some("trip_2026-11-22_10-00-00_123_4"));
+    assert!(finalizing.finalizing && !finalizing.active && !finalizing.failed);
+    assert_eq!(finalizing.recording, "trip_2026-11-22_10-00-00_123_4");
+    assert_eq!((finalizing.elapsed_ms, finalizing.bytes), (0, 0));
+
+    let beside = status_of(
+        Some(&recorder_status(true, "recordings/next.mcpr", None)),
+        Some("trip"),
+    );
+    assert!(beside.finalizing && beside.active);
+    assert_eq!(beside.recording, "next");
 }
 
 /// A mod records the world session: nothing without one, one recording at a time, the status
@@ -126,12 +152,31 @@ fn a_client_mod_records_the_session_into_the_recordings_folder() {
             "the archive appears when the recording ends"
         );
 
+        // Stop answers with the id at once; the archive follows in the background.
         assert_eq!(game.recording_stop(), Ok(id.clone()));
+        let status = game.recording_status();
+        assert!(!status.active);
+        assert_eq!(game.recording_stop(), Err(RecordingError::NotRecording));
+        if status.finalizing {
+            assert_eq!(status.recording, id);
+            assert_eq!(game.recording_start(None), Err(RecordingError::Finalizing));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while game.recording_status().finalizing {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the archive never finished"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(game.recording_status(), status_of(None, None));
         assert_eq!(
             recording_path(root.path(), &id),
             Ok(root.path().join(format!("{id}.mcpr")))
         );
-        assert!(!game.recording_status().active);
-        assert_eq!(game.recording_stop(), Err(RecordingError::NotRecording));
+        // Once the archive is in place a new recording can start.
+        let next = game.recording_start(None).unwrap();
+        assert_ne!(next, id);
+        game.recording_stop().unwrap();
     });
 }

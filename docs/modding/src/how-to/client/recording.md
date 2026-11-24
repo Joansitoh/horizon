@@ -7,9 +7,9 @@ recording is named by its **id**: its file name without `.mcpr`, the id [`replay
 
 | Call | Access | What it does |
 |---|---|---|
-| `recording_status()` | client setup | How the recording stands, whoever started it: `active`, `recording` (its id), `elapsed_ms`, `bytes` written and `failed`. All empty, zero or false while no recording runs. |
-| `recording_start(name)` | world | Starts recording the world session's packets and answers the recording's id. |
-| `recording_stop()` | world | Stops the recording, whoever started it, writes its `.mcpr` archive and answers the id. |
+| `recording_status()` | client setup | How the recording stands, whoever started it: `active`, `recording` (its id), `elapsed_ms`, `bytes` written, `failed` and `finalizing`. All empty, zero or false while no recording runs. |
+| `recording_start(name)` | world | Starts recording the world session's packets and answers the recording's id. `Finalizing` while the previous archive is still being written. |
+| `recording_stop()` | world | Stops the recording, whoever started it, and answers the id at once; the `.mcpr` archive is written in the background. |
 
 The rules are those of `/studio record`:
 
@@ -22,19 +22,37 @@ The rules are those of `/studio record`:
   share a file. The id is that file name without `.mcpr`.
 - **The same privacy filter.** What the recording keeps is the platform's, unchanged: chat, the tab list, player
   accounts and similar data are left out, and an unknown packet is not recorded.
-- **A world session is needed.** `NotConnected` on the title screen or any menu with no world behind it, and while
-  a replay plays. A single-player world, a multiplayer server and a LAN guest all record what the client receives.
-- **The file appears when the recording ends.** While it runs the packets go to a temporary file beside it, so
-  `replay_open(id)` is `NotFound` until `recording_stop` answers. The recorder belongs to the session: leaving the
-  world ends the recording with it, and `recording_status` reads as no recording in the next one. Stop it first to be
+- **A world session is needed.** `recording_start` is `NotConnected` on the title screen or any menu with no world
+  behind it, and while a replay plays. `recording_stop` is `NotConnected` with no world session too, and during a
+  replay only when no recorder runs: a recorder `/studio record` started during a replay stays stoppable (with
+  none, it answers `NotRecording` as anywhere else). A single-player world, a multiplayer server and a LAN guest all record what the client receives.
+- **The file appears when the archive is finished.** While the recording runs the packets go to a temporary file
+  beside it, so `replay_open(id)` is `NotFound` until `recording_status` no longer says `finalizing` after
+  `recording_stop`. The recorder belongs to the session: leaving the world ends the recording with it, and
+  `recording_status` reads as no recording in the next one. Stop it first, and wait for `finalizing` to clear, to be
   sure its archive is written.
 
 When the recorder fails (the disk refuses a write, or falls too far behind) it stops taking packets by itself:
 `recording_status` then reads `active` false and `failed` true, with the id and the bytes it got to; `elapsed_ms` keeps counting.
 `recording_stop` ends the recording as usual and answers `DiskError`; the file may be incomplete or missing.
 
-`recording_stop` writes the archive on the game's thread before it answers, as `/studio record stop` does, so a
-long recording takes a moment. `recording_status` is cheap enough to read every frame.
+## Finalizing
+
+`recording_stop` never waits for the archive: it answers the id at once, and compressing and syncing the
+`.mcpr` file runs on a thread of its own, so stopping a long recording does not stall a frame. Until the archive is in the
+recordings folder `recording_status` reads `finalizing` true (with `active` false, and `recording` naming the
+recording being finished while no other one runs), then goes back to all empty. Poll it before you
+`replay_open` the id.
+
+- `recording_start` answers `Finalizing` while the previous archive is being written, and changes nothing: wait for
+  the status to stop saying so and ask again. (A recording could be made beside it, but one status could not tell the
+  two apart.) It is checked before `AlreadyRecording`.
+- If the archive cannot be finished (a full disk, say) the game logs it, `finalizing` goes back to false and the id
+  has no file: `replay_open` answers `NotFound`.
+- Packaging recordings an earlier crash left behind runs in the background too, when a recording starts; it never
+  delays `recording_start`, and a recovered recording shows up in `recordings/` a moment later.
+
+`recording_status` is cheap enough to read every frame.
 
 `RecordingStatus` and `RecordingError` are `#[non_exhaustive]` for Rust callers only. On the wire every field and
 variant is encoded and its layout hashed ([wire types](../../concepts/wire-types.md)), so they stay as they are:

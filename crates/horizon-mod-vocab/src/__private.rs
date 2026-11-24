@@ -307,6 +307,7 @@ pub mod built {
         elapsed_ms: u64,
         bytes: u64,
         failed: bool,
+        finalizing: bool,
     ) -> crate::RecordingStatus {
         crate::RecordingStatus {
             active,
@@ -314,6 +315,7 @@ pub mod built {
             elapsed_ms,
             bytes,
             failed,
+            finalizing,
         }
     }
     /// The mod export's status snapshot, constructed by the game.

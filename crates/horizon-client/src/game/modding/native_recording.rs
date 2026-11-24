@@ -4,10 +4,34 @@
 //! the recorder's privacy filter, and one recording runs at a time, whoever started it.
 use super::Game;
 use super::replay::StudioRecordError;
-use horizon_client::file_id::valid_id;
+use horizon_client::file_id::{reparse_point, valid_id};
 use horizon_client::studio::{RecorderStatus, generate_recording_filename};
 use mod_api::{RecordingError, RecordingStatus};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// A recording `recording_stop` ended, whose archive is being written on a thread of its own.
+pub(super) struct Finalizing {
+    id: String,
+    done: Arc<AtomicBool>,
+}
+
+impl Finalizing {
+    fn running(&self) -> bool {
+        !self.done.load(Ordering::Acquire)
+    }
+}
+
+/// Marks the archive finished when dropped: after it was written or failed, and also when the
+/// thread that would write it never started, so a status never says `finalizing` for good.
+struct DoneOnDrop(Arc<AtomicBool>);
+
+impl Drop for DoneOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 
 /// The id the recording at `path` goes by, as `replay_open` takes it: its file name without
 /// `.mcpr`; empty when no id can hold that name.
@@ -20,10 +44,23 @@ pub(super) fn recording_id_of(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// What a mod reads of the recorder `status` says (none: no recording).
-pub(super) fn status_of(status: Option<&RecorderStatus>) -> RecordingStatus {
+/// What a mod reads of the recorder `status` says (none: no recording) and of the archive being
+/// finished in the background (`finalizing`: its id), which names the recording while no other
+/// runs.
+pub(super) fn status_of(
+    status: Option<&RecorderStatus>,
+    finalizing: Option<&str>,
+) -> RecordingStatus {
     let Some(status) = status else {
-        return mod_api::__private::built::recording_status(false, String::new(), 0, 0, false);
+        let id = finalizing.unwrap_or_default().to_owned();
+        return mod_api::__private::built::recording_status(
+            false,
+            id,
+            0,
+            0,
+            false,
+            finalizing.is_some(),
+        );
     };
     mod_api::__private::built::recording_status(
         status.active,
@@ -31,7 +68,22 @@ pub(super) fn status_of(status: Option<&RecorderStatus>) -> RecordingStatus {
         u64::try_from(status.elapsed.as_millis()).unwrap_or(u64::MAX),
         status.bytes_written,
         status.error.is_some(),
+        finalizing.is_some(),
     )
+}
+
+/// A `recordings/` folder that is itself a link (a symlink, or a junction on Windows) is
+/// allowed, a player may keep recordings on another drive: the log names where they go.
+fn log_linked_folder(dir: &Path) {
+    let linked = std::fs::symlink_metadata(dir)
+        .is_ok_and(|meta| meta.file_type().is_symlink() || reparse_point(&meta));
+    if linked && let Ok(real) = std::fs::canonicalize(dir) {
+        log::info!(
+            "A mod's recording goes to {}, where {} links to",
+            real.display(),
+            dir.display()
+        );
+    }
 }
 
 impl Game<'_> {
@@ -41,7 +93,15 @@ impl Game<'_> {
             .remote
             .as_ref()
             .and_then(|remote| remote.session.recorder_status());
-        status_of(status.as_ref())
+        let finalizing = self
+            .replay
+            .finalizing
+            .as_ref()
+            .filter(|finalizing| finalizing.running());
+        status_of(
+            status.as_ref(),
+            finalizing.map(|finalizing| finalizing.id.as_str()),
+        )
     }
 
     /// Starts recording the world session into the recordings folder, under a file name the
@@ -52,10 +112,23 @@ impl Game<'_> {
         if self.replay.playing() {
             return Err(RecordingError::NotConnected);
         }
+        // Another recording could be made beside the one being finished, but the status could
+        // then not tell the two apart: a mod waits for the archive instead.
+        if self
+            .replay
+            .finalizing
+            .as_ref()
+            .is_some_and(Finalizing::running)
+        {
+            return Err(RecordingError::Finalizing);
+        }
         let file_name = generate_recording_filename(name);
         let dir = self.recordings_dir();
         match self.begin_studio_recording(&dir, &file_name) {
-            Ok(path) => Ok(recording_id_of(&path)),
+            Ok(path) => {
+                log_linked_folder(&dir);
+                Ok(recording_id_of(&path))
+            }
             Err(StudioRecordError::NoSession) => Err(RecordingError::NotConnected),
             Err(StudioRecordError::Active) => Err(RecordingError::AlreadyRecording),
             Err(StudioRecordError::Disk(error)) => {
@@ -65,18 +138,37 @@ impl Game<'_> {
         }
     }
 
-    /// Finishes the recording, whoever started it, and writes its archive; the recording's id.
+    /// Ends the recording, whoever started it, and answers its id at once: the archive is written
+    /// on a thread of its own, while `recording_status` says `finalizing`.
     pub(super) fn recording_stop(&mut self) -> Result<String, RecordingError> {
         let Some(remote) = self.remote.as_ref() else {
             return Err(RecordingError::NotConnected);
         };
-        match remote.session.stop_recording() {
-            Some(Ok(path)) => Ok(recording_id_of(&path)),
-            Some(Err(error)) => {
-                log::warn!("A mod's recording ended with an error: {error}");
-                Err(RecordingError::DiskError)
+        let done = Arc::new(AtomicBool::new(false));
+        let marker = DoneOnDrop(done.clone());
+        let stopped = remote.session.stop_recording_in_background(move |result| {
+            let _marker = marker;
+            match result {
+                Ok(path) => log::info!("A mod's recording was written to {}", path.display()),
+                Err(error) => log::warn!("A mod's recording could not be finished: {error}"),
             }
-            // A replay plays no recorder (checked first, so a running recorder stays stoppable).
+        });
+        match stopped {
+            Some(status) => {
+                let id = recording_id_of(&status.path);
+                self.replay.finalizing = Some(Finalizing {
+                    id: id.clone(),
+                    done,
+                });
+                match status.error {
+                    Some(error) => {
+                        log::warn!("A mod's recording ended with an error: {error}");
+                        Err(RecordingError::DiskError)
+                    }
+                    None => Ok(id),
+                }
+            }
+            // A replay plays no recorder (checked after, so a running recorder stays stoppable).
             None if self.replay.playing() => Err(RecordingError::NotConnected),
             None => Err(RecordingError::NotRecording),
         }
