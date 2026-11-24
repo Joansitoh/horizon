@@ -524,6 +524,7 @@ pub mod capture;
 mod celestial;
 mod census;
 pub mod compositor;
+pub(crate) mod core_lightmap;
 pub(crate) mod core_lines;
 pub(crate) mod core_sky;
 pub(crate) mod core_text;
@@ -566,6 +567,7 @@ mod lod;
 mod looks;
 #[cfg(any(test, feature = "test-support"))]
 pub use looks::PartLooks;
+mod mod_celestial;
 pub mod mod_pipelines;
 pub mod native_entity;
 mod native_executor;
@@ -1236,6 +1238,8 @@ pub struct Frame<'a> {
     pub cave_culling: bool,
     /// Title screen: only the dedicated panorama cube map and the HUD.
     pub title: bool,
+    /// Present the HUD and screens over black, without a world or a panorama.
+    pub gui_only: bool,
     /// Lava, powder snow, blindness, darkness or a boss bar's world fog leaves out the sky pass
     /// (`fog::sky_pass_skipped`).
     pub sky_blocked: bool,
@@ -1736,6 +1740,12 @@ pub struct Renderer {
     core_text: Option<core_text::CoreText>,
     /// The packs' `core/sky` and `core/stars`, drawn in place of the native sky and stars.
     core_sky: Option<core_sky::CoreSky>,
+    /// A resource pack's `core/lightmap`, which draws the lightmap texture in place of the
+    /// CPU-built vanilla formula.
+    pack_lightmap: Option<core_lightmap::PackLightmap>,
+    /// Whether the CPU built the lightmap texture last: the pack's shader
+    /// redraws over a fullbright's CPU build even with unchanged inputs.
+    lightmap_from_cpu: bool,
     /// Gizmo lines: opaque ones (`RenderTypes.lines`, which writes depth),
     /// translucent ones (`RenderTypes.linesTranslucentNoDepthWrite`) and the
     /// always-on-top ones.
@@ -1804,6 +1814,7 @@ pub struct Renderer {
     celestial_after_solid_globals: wgpu::Buffer,
     celestial_after_solid_group: wgpu::BindGroup,
     celestial_buffer: wgpu::Buffer,
+    mod_celestial: Option<mod_celestial::Layer>,
     end_sky: end_sky::EndSky,
     stars: stars::Stars,
     /// Custom sky layers (`crate::custom_sky`), and the frame's from the game.
@@ -2067,6 +2078,8 @@ pub struct Renderer {
     hdr_driver: Option<String>,
     /// Whether the Look setting is Horizon's, kept for the HDR output made when HDR turns on.
     hdr_lighting_setting: bool,
+    /// Player's hardware ray tracing setting (`Graphics::ray_tracing`).
+    ray_tracing_mode: crate::graphics::RayTracingMode,
     /// The shader pack's post-processing, and the dimension (legacy id) it was loaded for.
     pack_post: Option<(i32, Option<pack_post::PackPost>)>,
     /// A `shaders/` pack whose pipelines build on a thread of their own (`load_shader_pack`).
@@ -2155,6 +2168,7 @@ pub struct Renderer {
     /// `draw_frame`'s frames past its early returns, and the one whose statistics are shown.
     frame_serial: u64,
     stats_frame: u64,
+    gui_only: bool,
     pub uploaded_bytes: u64,
     started: Instant,
     /// The next frame to write to a PNG path (control socket, F2, world icon).
@@ -2779,7 +2793,13 @@ impl Renderer {
             }
             None => {
                 let _step = crate::spans::startup::step("renderer.open_device");
-                open_device(&window, offscreen, api, request.needs(layers)).await?
+                open_device(
+                    &window,
+                    offscreen,
+                    api,
+                    request.needs(layers, settings.ray_tracing),
+                )
+                .await?
             }
         };
         // A device that is already lost, one `previous` handed over included, makes every
@@ -3611,7 +3631,10 @@ impl Renderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                // A pack's core/lightmap draws the texture in place (`Lightmap.render`).
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         let lightmap_view = lightmap.create_view(&Default::default());
@@ -4386,6 +4409,8 @@ impl Renderer {
             (frame_format, linear_light),
             wgpu::CompareFunction::Equal,
         );
+        let mod_celestial =
+            mod_celestial::Layer::listened(&entity_layout, (frame_format, linear_light));
         drop(entity_step);
         // WorldBorderRenderer: misc/forcefield.png as a MipmappedTexture
         // (repeat, linear minification with mipmaps, nearest magnification).
@@ -4967,7 +4992,7 @@ impl Renderer {
             last_wait: std::time::Duration::ZERO,
             last_encode: std::time::Duration::ZERO,
             window,
-            ray_scene: rt::scene::RayScene::forced(&device),
+            ray_scene: rt::scene::RayScene::forced(&device, settings.ray_tracing),
             looks_layout: None,
             device,
             reuse,
@@ -5012,6 +5037,8 @@ impl Renderer {
             core_lines: None,
             core_text: None,
             core_sky: None,
+            pack_lightmap: None,
+            lightmap_from_cpu: false,
             debug_lines_opaque,
             debug_lines,
             debug_lines_on_top,
@@ -5058,6 +5085,7 @@ impl Renderer {
             celestial_after_solid_globals,
             celestial_after_solid_group,
             celestial_buffer,
+            mod_celestial,
             end_sky: end_sky::EndSky::default(),
             stars,
             custom_sky,
@@ -5197,6 +5225,7 @@ impl Renderer {
             entity_atlas: atlas_view.clone(),
             hdr: None,
             hdr_lighting_setting: true,
+            ray_tracing_mode: settings.ray_tracing,
             emission_stats,
             output_caps,
             output_rejected: None,
@@ -5249,6 +5278,7 @@ impl Renderer {
             section_draw_calls: 0,
             frame_serial: 0,
             stats_frame: 0,
+            gui_only: false,
             uploaded_bytes: 0,
             started: Instant::now(),
             screenshot: None,
@@ -5337,17 +5367,32 @@ impl Renderer {
         self.core_lines =
             program.and_then(|program| core_lines::CoreLines::new(&self.device, format, program));
     }
-    /// The resource packs' `core/sky` and `core/stars` (`HudAtlas::sky_shader`,
-    /// `stars_shader`), or the built-in sky and stars.
+    /// The resource packs' sky disc, stars, and sunrise/sunset programs, or the built-in sky.
     pub fn set_sky_shaders(
         &mut self,
         disc: Option<&crate::core_shader::CoreProgram>,
         stars: Option<&crate::core_shader::CoreProgram>,
+        sunrise: Option<&crate::core_shader::CoreProgram>,
     ) {
         // As `set_lines_shader`: not on a frame of linear light.
         let keep = !self.output.frame.linear_light;
-        let (disc, stars) = (disc.filter(|_| keep), stars.filter(|_| keep));
-        self.core_sky = core_sky::CoreSky::new(&self.device, self.output.frame.format, disc, stars);
+        self.core_sky = core_sky::CoreSky::new(
+            &self.device,
+            self.output.frame.format,
+            disc.filter(|_| keep),
+            stars.filter(|_| keep),
+            sunrise.filter(|_| keep),
+        );
+    }
+    /// A resource pack's `core/lightmap` (`HudAtlas::lightmap_shader`), which draws the
+    /// lightmap texture in place of the CPU-built vanilla formula.
+    pub fn set_lightmap_shader(&mut self, program: Option<&crate::core_shader::CoreProgram>) {
+        self.pack_lightmap =
+            program.and_then(|p| core_lightmap::PackLightmap::new(&self.device, p));
+        // The next frame draws the lightmap again, whichever shader won.
+        self.lightmap_uploaded = false;
+        self.lightmap_key = None;
+        self.lightmap_from_cpu = false;
     }
     /// LevelRenderer.submitBlockOutline: the buffer holds `edges` per stroke, the black
     /// secondary stroke first when high contrast is on.
@@ -5394,6 +5439,7 @@ impl Renderer {
     fn upload_again(&mut self) {
         self.lightmap_uploaded = false;
         self.lightmap_key = None;
+        self.lightmap_from_cpu = false;
         self.static_entity_catalog_revision = 0;
         for section in self.static_entity_sections.values_mut() {
             section.revision = 0;
@@ -6985,6 +7031,29 @@ impl Renderer {
             hdr.look = on;
         }
     }
+    /// Applies the player's `rayTracing` setting (`Graphics::ray_tracing`), dropping or building
+    /// `RayScene` immediately when the device supports hardware ray queries.
+    pub fn set_ray_tracing(&mut self, mode: crate::graphics::RayTracingMode) {
+        if self.ray_tracing_mode == mode {
+            return;
+        }
+        self.ray_tracing_mode = mode;
+        let traces = self.executor.is_some_and(|c| c.ray_scene);
+        let had = self.ray_scene.is_some();
+        rt::scene::follow(
+            &mut self.ray_scene,
+            &self.device,
+            rt::query::wanted(rt::query::switch_with(mode), traces),
+        );
+        // The pack's trace groups hold the dropped scene's buffers: they go with it, so a later
+        // scene, whose generations start over, never draws with them.
+        if had
+            && self.ray_scene.is_none()
+            && let Some(native) = &mut self.external
+        {
+            native.bind_scene(&self.device, None, glam::DVec3::ZERO);
+        }
+    }
     /// Measures which pixels of each block sprite may shine (`hdr_stats`), at the current
     /// masks. Only with HDR output on: nothing else reads them.
     pub fn measure_emission(&mut self) {
@@ -7195,6 +7264,13 @@ impl Renderer {
         if let Some((_, Some(post))) = &mut self.pack_post {
             post.reset_history(&self.device);
         }
+        // `[frame] jitter` advances TAA's Halton phase: a restarted pack starts it again.
+        self.world_post.reset_temporal_sequence();
+    }
+    /// Whether the running Horizon pack moves the world by TAA's offset under its own post
+    /// chain (`[frame] jitter`), the player's TAA on or off.
+    pub fn pack_jitters(&self) -> bool {
+        self.executor.is_some_and(|c| c.jitter)
     }
     /// The running shader pack's kind: `iris` (a `shaders/` pack) or `native` (one of
     /// Horizon's own).
@@ -7858,6 +7934,13 @@ impl Renderer {
         }
     }
 
+    /// The running `shaders/` pack has found no room in video memory for what it draws into for
+    /// too many frames in a row (`PackPost::out_of_room`): the game turns it off
+    /// (`set_shader_pack` without a pack), which frees what it holds, before the frames given
+    /// up end the game (`frame_given_up`).
+    pub fn shader_pack_out_of_room(&self) -> bool {
+        matches!(&self.pack_post, Some((_, Some(post))) if post.out_of_room())
+    }
     /// The dimension the shader pack was last set for.
     pub fn shader_pack_dimension(&self) -> Option<i32> {
         let loading = self.pack_loading.as_ref().map(|l| l.dimension);
@@ -7994,6 +8077,72 @@ impl Renderer {
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
         View::screen(yaw, pitch, fov_degrees, aspect, far)
     }
+    /// The vanilla formula's lightmap (`lightmap.fsh`), per (block, sky) level: the texture when
+    /// no pack's core/lightmap runs, and the table the debug lightmap overlay reads either way.
+    fn vanilla_lightmap_pixels(
+        sky: &Sky,
+        darkness: f32,
+        gamma: f32,
+        night_vision: f32,
+        flicker: f32,
+        boss_darken: f32,
+    ) -> [u8; 16 * 16 * 4] {
+        let brightness = |level: f32| level / (4.0 - 3.0 * level);
+        let mut pixels = [0u8; 16 * 16 * 4];
+        for s in 0..16 {
+            for b in 0..16 {
+                let block_level = b as f32 / 15.0;
+                let sky_level = s as f32 / 15.0;
+                let block_brightness = brightness(block_level) * (1.4 + flicker);
+                let sky_brightness = brightness(sky_level) * sky.sky_light_factor;
+                // NightVisionColor defaults to 0x999999.
+                let mut color =
+                    Vec3::from(sky.ambient_light_color).max(Vec3::splat(0.6 * night_vision));
+                color += Vec3::from(sky.sky_light_color) * sky_brightness;
+                let parabolic = (2.0 * block_level - 1.0).powi(2);
+                let block_color = Vec3::from(sky.block_light_tint).lerp(Vec3::ONE, 0.9 * parabolic);
+                color += block_color * block_brightness;
+                // lightmap.fsh: a boss bar mixes the light toward 70/60/60%.
+                color = color.lerp(color * Vec3::new(0.7, 0.6, 0.6), boss_darken);
+                color -= Vec3::splat(darkness);
+                color = color.clamp(Vec3::ZERO, Vec3::ONE);
+                let max = color.max_element().max(1e-6);
+                let inverted = 1.0 - max;
+                let scaled = 1.0 - inverted.powi(4);
+                let not_gamma = color * (scaled / max);
+                color = color.lerp(not_gamma, gamma);
+                let i = (s * 16 + b) * 4;
+                pixels[i] = (color.x * 255.0) as u8;
+                pixels[i + 1] = (color.y * 255.0) as u8;
+                pixels[i + 2] = (color.z * 255.0) as u8;
+                pixels[i + 3] = 255;
+            }
+        }
+        pixels
+    }
+    /// Whether the pack's lightmap shader redraws the texture this frame:
+    /// nothing drew it yet, or the CPU built it last (a fullbright toggle
+    /// overwrote the pack's draw), or an input changed.
+    fn pack_lightmap_needs_draw(
+        uploaded: bool,
+        from_cpu: bool,
+        key: Option<LightmapKey>,
+        next: &LightmapKey,
+    ) -> bool {
+        !uploaded || from_cpu || key != Some(*next)
+    }
+    /// Whether the CPU-built lightmap re-uploads this frame: it differs from
+    /// the last table, or nothing drew the texture yet. (`lightmap_pixels`
+    /// keeps the vanilla formula's table even while the pack's shader draws
+    /// the texture, so an unchanged table after a pack draw is the CPU back
+    /// at its steady state — the pack's next draw, not the CPU's, reacts.)
+    fn cpu_lightmap_needs_upload(
+        pixels: &[u8; 16 * 16 * 4],
+        table: &[u8; 16 * 16 * 4],
+        uploaded: bool,
+    ) -> bool {
+        pixels != table || !uploaded
+    }
     fn update_lightmap(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -8004,6 +8153,11 @@ impl Renderer {
         flicker: f32,
         boss_darken: f32,
     ) {
+        // A resource pack's core/lightmap draws the texture on the GPU
+        // (`RenderPipelines.LIGHTMAP`, `Lightmap.render`), a fullbright pack's
+        // lightmap shader among them. `lightmap_pixels` stays the vanilla
+        // formula's table: the debug lightmap overlay and the external
+        // lightmap read it, and it is what the CPU path builds.
         let key = LightmapKey::new(
             sky,
             darkness,
@@ -8013,48 +8167,65 @@ impl Renderer {
             boss_darken,
             self.fullbright,
         );
-        if self.lightmap_uploaded && self.lightmap_key == Some(key) {
+        if !self.fullbright {
+            let data =
+                core_lightmap::uniforms(sky, darkness, gamma, night_vision, flicker, boss_darken);
+            if let Some(lightmap) = self.pack_lightmap.as_ref() {
+                if Self::pack_lightmap_needs_draw(
+                    self.lightmap_uploaded,
+                    self.lightmap_from_cpu,
+                    self.lightmap_key,
+                    &key,
+                ) {
+                    lightmap.prepare(&mut self.uploads, encoder, &data);
+                    let view = self.lightmap_view.clone();
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("Resource pack lightmap"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Load,
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+                        lightmap.draw(&mut pass);
+                    }
+                    self.lightmap_uploaded = true;
+                    self.lightmap_from_cpu = false;
+                    self.lightmap_key = Some(key);
+                    self.lightmap_pixels = Self::vanilla_lightmap_pixels(
+                        sky,
+                        darkness,
+                        gamma,
+                        night_vision,
+                        flicker,
+                        boss_darken,
+                    );
+                }
+                return;
+            }
+        }
+        // Same inputs as the texture the CPU last built: nothing to redo.
+        if self.lightmap_uploaded && self.lightmap_from_cpu && self.lightmap_key == Some(key) {
             return;
         }
-        let mut pixels = [255u8; 16 * 16 * 4];
-        if !self.fullbright {
-            // lightmap.fsh: per (block, sky) level.
-            let brightness = |level: f32| level / (4.0 - 3.0 * level);
-            for s in 0..16 {
-                for b in 0..16 {
-                    let block_level = b as f32 / 15.0;
-                    let sky_level = s as f32 / 15.0;
-                    let block_brightness = brightness(block_level) * (1.4 + flicker);
-                    let sky_brightness = brightness(sky_level) * sky.sky_light_factor;
-                    // NightVisionColor defaults to 0x999999.
-                    let mut color =
-                        Vec3::from(sky.ambient_light_color).max(Vec3::splat(0.6 * night_vision));
-                    color += Vec3::from(sky.sky_light_color) * sky_brightness;
-                    let parabolic = (2.0 * block_level - 1.0).powi(2);
-                    let block_color =
-                        Vec3::from(sky.block_light_tint).lerp(Vec3::ONE, 0.9 * parabolic);
-                    color += block_color * block_brightness;
-                    // lightmap.fsh: a boss bar mixes the light toward 70/60/60%.
-                    color = color.lerp(color * Vec3::new(0.7, 0.6, 0.6), boss_darken);
-                    color -= Vec3::splat(darkness);
-                    color = color.clamp(Vec3::ZERO, Vec3::ONE);
-                    let max = color.max_element().max(1e-6);
-                    let inverted = 1.0 - max;
-                    let scaled = 1.0 - inverted.powi(4);
-                    let not_gamma = color * (scaled / max);
-                    color = color.lerp(not_gamma, gamma);
-                    let i = (s * 16 + b) * 4;
-                    pixels[i] = (color.x * 255.0) as u8;
-                    pixels[i + 1] = (color.y * 255.0) as u8;
-                    pixels[i + 2] = (color.z * 255.0) as u8;
-                    pixels[i + 3] = 255;
-                }
-            }
+        // lightmap.fsh: per (block, sky) level.
+        let mut pixels =
+            Self::vanilla_lightmap_pixels(sky, darkness, gamma, night_vision, flicker, boss_darken);
+        if self.fullbright {
+            pixels.fill(255);
         }
         // The lightmap changes with the time of day, flicker and effects,
         // not every frame: upload only what differs from the texture.
         self.lightmap_key = Some(key);
-        if pixels == self.lightmap_pixels && self.lightmap_uploaded {
+        if !Self::cpu_lightmap_needs_upload(&pixels, &self.lightmap_pixels, self.lightmap_uploaded)
+        {
             return;
         }
         self.uploads.texture(
@@ -8071,6 +8242,7 @@ impl Renderer {
         );
         self.lightmap_pixels = pixels;
         self.lightmap_uploaded = true;
+        self.lightmap_from_cpu = true;
     }
     fn animate(&mut self, encoder: &mut wgpu::CommandEncoder, tick: u64, cull_inactive: bool) {
         let active = cull_inactive.then_some(&self.active_animated_layers[..]);
@@ -8149,7 +8321,10 @@ impl Renderer {
             self.flush_frame_export_uploads();
             return Ok(false);
         }
-        if let Some(request) = self.capture.take() {
+        // A scene capture describes a world, unlike a screenshot of what was presented.
+        if !frame.gui_only
+            && let Some(request) = self.capture.take()
+        {
             let result = self.write_capture(&request, frame);
             self.capture_result = Some(result.map_err(|e| e.to_string()));
         }
@@ -8327,11 +8502,17 @@ impl Renderer {
         if std::mem::take(&mut self.frame_lost) {
             self.upload_again();
         }
+        // A GUI-only interval interrupts world history even if the surface refuses its frame.
+        if frame.gui_only && !self.gui_only {
+            self.world_post.reset_temporal_sequence();
+            self.reset_shader_pack_history();
+        }
+        self.gui_only = frame.gui_only;
         // World frames alone follow the shader pack: the game loads the picked one
         // before it draws one. Title frames draw no terrain and keep the layout
         // through a pack dropped (Shader Options) or not loaded yet (`Renderer::new`),
         // so the next world's sections, which the level loading screen uploads, stay.
-        if !frame.title {
+        if !frame.title && !frame.gui_only {
             self.follow_terrain_looks();
             self.follow_translucent_layout();
             self.follow_packed_layout();
@@ -8438,7 +8619,8 @@ impl Renderer {
         // into frames of its own. Not over menus that blur the frame, a shader pack's own post
         // passes, HDR output without the HUD's layer (or the float frame HDR was started
         // with) or the title screen.
-        let fg = self.frame_export.is_none()
+        let fg = !frame.gui_only
+            && self.frame_export.is_none()
             && self.frame_gen.on
             && !(self.frame_gen.paused || self.frame_gen.refused || self.frame_gen.no_room)
             && (self.hdr.as_ref()).map_or(
@@ -8563,7 +8745,7 @@ impl Renderer {
         };
         // The section copies staged since the last frame, in a command buffer of their own
         // submitted before the frame's: a frame given up (`abandon_frame`) still submits them.
-        let mut copies = self.take_section_copies();
+        let copies = self.take_section_copies();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -8598,6 +8780,66 @@ impl Renderer {
                 );
                 self.last_hud_animated_tick = Some(frame.ticks);
             }
+        }
+        if frame.gui_only {
+            self.frame_serial += 1;
+            self.show_stats(self.frame_serial, [0; 3]);
+            self.hud.prepare(
+                &self.device,
+                &mut self.uploads,
+                &mut encoder,
+                frame.hud,
+                size,
+            );
+            if let Some(timer) = &mut self.gpu_timer {
+                timer.begin(&mut encoder);
+            }
+            let view_target = target_texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.output.frame.format),
+                ..Default::default()
+            });
+            // Clear the actual frame, including the world-light target under the layered
+            // HDR HUD. No previous world pixels can show through.
+            let color_attachments = [Some(wgpu::RenderPassColorAttachment {
+                view: &view_target,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })];
+            drop(
+                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("GUI background"),
+                    timestamp_writes: self
+                        .own_timing
+                        .as_mut()
+                        .and_then(|t| t.writes("GUI background")),
+                    color_attachments: &color_attachments,
+                    ..Default::default()
+                }),
+            );
+            return self.present_frame(PresentFrame {
+                frame,
+                overlay: Overlay {
+                    real: true,
+                    ..Default::default()
+                },
+                target_texture,
+                view_target,
+                encoder,
+                copies,
+                surface_frame,
+                reconfigure,
+                fg_frames,
+                fg_made,
+                checks,
+                backstop,
+                started,
+                laps,
+                world: None,
+            });
         }
         self.update_lightmap(
             &mut encoder,
@@ -8637,9 +8879,12 @@ impl Renderer {
             hdr_gain,
             hdr_settings,
         ));
+        // A pack that resolves its own world may still ask for TAA's offset (`[frame] jitter`).
+        let pack_jitter = !frame.title && self.executor.is_some_and(|c| c.jitter);
         let jitter = self.world_post.jitter(
             [self.config.width, self.config.height],
             taa,
+            pack_jitter,
             view_proj,
             frame.camera,
         );
@@ -8898,18 +9143,15 @@ impl Renderer {
         if let Some(pipeline) = self.external.as_mut().filter(|_| !frame.title) {
             pipeline.begin_frame(&state);
         }
-        let shadow_view = self
-            .pack_post
-            .as_ref()
-            .and_then(|p| p.1.as_ref())
-            .filter(|_| !frame.title)
-            .and_then(|p| p.shadow_view(frame))
-            .or_else(|| {
-                self.external
-                    .as_ref()
-                    .filter(|_| !frame.title)?
-                    .shadow_request(&state)
-            });
+        let shadow_view = if frame.title {
+            None
+        } else {
+            self.pack_post
+                .as_ref()
+                .and_then(|p| p.1.as_ref())
+                .and_then(|p| external::ExternalPipeline::shadow_request(p, &state))
+                .or_else(|| self.external.as_ref()?.shadow_request(&state))
+        };
         let pack_terrain = !frame.title
             && self
                 .pack_post
@@ -9836,7 +10078,24 @@ impl Renderer {
                     fog,
                 )
             });
-            core.prepare(&mut self.uploads, &mut encoder, &sky, stars.as_deref());
+            let sunrise_color = frame.sky.sunrise_color;
+            let sunrise = (core.draws_sunrise() && sunrise_color[3] > 0.001).then(|| {
+                core_sky::uniforms(
+                    block,
+                    projection,
+                    core_sky::sunrise_model_view(view.view, frame.sky.sun_angle, sunrise_color[3]),
+                    sunrise_color,
+                    fog_color,
+                    fog,
+                )
+            });
+            core.prepare(
+                &mut self.uploads,
+                &mut encoder,
+                &sky,
+                stars.as_deref(),
+                sunrise.as_deref(),
+            );
         }
         let skin = frame.skin.filter(|skin| match &mut self.entity_skin {
             Some(skinner) => skinner.register(&self.device, &mut self.uploads, &mut encoder, skin),
@@ -10934,13 +11193,8 @@ impl Renderer {
                 let mut fog_ends = globals.fog_ends;
                 fog_ends[3] = plane;
                 // Water samples the mirror at its jittered screen position: the mirror takes the
-                // world's jitter, while TAA runs.
-                let mirrored = view::mirror_view_projection(view_proj, plane);
-                let mirrored = if taa && self.world_post.taa {
-                    jitter * mirrored
-                } else {
-                    mirrored
-                };
+                // world's jitter (TAA's or the pack's; identity while the world is still).
+                let mirrored = jitter * view::mirror_view_projection(view_proj, plane);
                 let mirror_globals = Globals {
                     view_proj: mirrored.to_cols_array_2d(),
                     inverse_view,
@@ -11095,6 +11349,29 @@ impl Renderer {
                 vis.fit(&self.device, [depth.width(), depth.height()], flat)
             };
         }
+        // Gather geometry only at the main sky pass's admission point. The pack ownership is
+        // known now, and the upload must be encoded before opening the pass that reads it.
+        let mod_celestial_vertices = if let Some(layer) = &mut self.mod_celestial
+            && !frame.title
+            && sky_visible
+            && frame.skybox
+            && !frame.end_sky
+            && pack_sky_visibility.sky
+            && !pack_draws_sky
+            && !pack_draws_celestial
+            && !native_sky_pass
+            && !self.executor.is_some_and(|pack| pack.replaces_sky)
+        {
+            layer.prepare(
+                &self.device,
+                &mut self.uploads,
+                &mut encoder,
+                jittered,
+                frame.sky.star_angle,
+            )
+        } else {
+            0
+        };
         {
             let attachments = [Some(wgpu::RenderPassColorAttachment {
                 view: world_view,
@@ -11161,6 +11438,12 @@ impl Renderer {
                     // sun, moon and stars.
                     if self.custom_sky.is_drawing() {
                         self.custom_sky.draw(&mut pass);
+                        pass.set_bind_group(0, &self.group, &[]);
+                    }
+                    if mod_celestial_vertices > 0
+                        && let Some(layer) = &self.mod_celestial
+                    {
+                        layer.draw(&mut pass, &self.entity_group, mod_celestial_vertices);
                         pass.set_bind_group(0, &self.group, &[]);
                     }
                 }
@@ -11806,6 +12089,15 @@ impl Renderer {
                 pack_frame(&mut pass);
                 pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
             }
+            // `[entity] surface`: the stage's entities write the surface target too, over the
+            // material stage's solid terrain or into a cleared one. The mods' prepared draws
+            // are Horizon's own pipeline throughout, which writes the colour alone.
+            let entity_surface = entity_stage.and_then(|e| e.surface);
+            let prepared = !self.prepared_draws.is_empty();
+            if let Some(target) = entity_surface {
+                drop(pass);
+                pass = terrain_pass(&mut encoder, target, surface.is_none());
+            }
             if static_entity_quads > 0 {
                 pass.stage(self.own_timing.as_mut(), "static block entities");
                 external::set_entity_pipeline(
@@ -11834,12 +12126,16 @@ impl Renderer {
                 }
                 pass.set_bind_group(0, &self.group, &[]);
             }
+            if entity_surface.is_some() && prepared {
+                drop(pass);
+                pass = plain_pass(&mut encoder);
+            }
             pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
-            if entity_quads > 0 || !self.prepared_draws.is_empty() {
+            if entity_quads > 0 || prepared {
                 pass.stage(self.own_timing.as_mut(), "entities");
                 external::set_entity_pipeline(
                     &mut pass,
-                    entity_stage,
+                    entity_stage.filter(|e| !prepared || e.surface.is_none()),
                     &self.entity_pipeline,
                     false,
                 );
@@ -11862,6 +12158,11 @@ impl Renderer {
                     );
                 }
                 pass.set_bind_group(0, &self.group, &[]);
+                pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
+            }
+            if entity_surface.is_some() && !prepared {
+                drop(pass);
+                pass = plain_pass(&mut encoder);
                 pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
             }
             if entity_stage.is_some() {
@@ -12557,7 +12858,7 @@ impl Renderer {
                 indices: self.indices.clone(),
                 quads: cloud_quads,
             }));
-            post.run(
+            let drawn = post.run(
                 &self.device,
                 &self.queue,
                 &mut encoder,
@@ -12575,6 +12876,17 @@ impl Renderer {
             // here until the next shader-pack frame (or forever once the pack is off).
             self.pack_pages.clear();
             self.pack_post = Some((dimension, Some(post)));
+            // No room for what the pack draws into (#13624): it kept nothing that failed, and
+            // makes it on the next frame.
+            if !drawn {
+                return self.abandon_frame(frame_targets::Abandoned::grown(
+                    encoder,
+                    copies,
+                    surface_frame,
+                    fg_frames,
+                    backstop,
+                ));
+            }
         } else if let Some((color, depth)) = &scaled
             && native_post
             && let Some(native) = &mut self.external
@@ -12663,6 +12975,13 @@ impl Renderer {
                     Some((_, depth)) => (depth, self.world_post.size().unwrap_or(size)),
                     None => (self.depth.as_ref().expect(WINDOW_DEPTH), size),
                 };
+                let look = pack_uniforms::world_look(
+                    frame,
+                    (self.pack_post.as_ref())
+                        .and_then(|p| p.1.as_ref())
+                        .map(|p| p.sun_path_rotation())
+                        .or_else(|| self.external.as_ref().map(|p| p.sun_path_rotation())),
+                );
                 native_render::world_drawn(&mut native_render::WorldDrawn {
                     device: &self.device,
                     queue: &self.queue,
@@ -12688,9 +13007,67 @@ impl Renderer {
                         nearest: &self.sprite_nearest,
                         filtered: &self.sprite_sampler,
                     },
+                    look,
                 });
             }
         }
+        let overlay = Overlay {
+            hand_quads: hand_quads * u32::from(!pack_draws_hand && !hand_in_world),
+            first_hand_vertex: match fg_made && frame_gen::generated_only() && self.hdr.is_some() {
+                true => made_hand_vertex,
+                false => ((world_quads + additive_quads) * 4) as i32,
+            },
+            crosshair,
+            first_crosshair: debug_depth + debug_top,
+            world_depth: scaled.is_none(),
+            msaa_depth: !fg && self.msaa_samples() > 1,
+            real: true,
+            hand_drawn: !pack_draws_hand,
+            hand_view_proj,
+        };
+        self.present_frame(PresentFrame {
+            frame,
+            overlay,
+            target_texture,
+            view_target,
+            encoder,
+            copies,
+            surface_frame,
+            reconfigure,
+            fg_frames,
+            fg_made,
+            checks,
+            backstop,
+            started,
+            laps,
+            world: Some(DrawnWorld {
+                visible,
+                visible_lods,
+                shadow_visible,
+                culling,
+                gpu_stats: gpu_frame.then_some((serial, cpu)),
+            }),
+        })
+    }
+
+    fn present_frame(&mut self, present: PresentFrame<'_, '_>) -> Result<bool> {
+        let PresentFrame {
+            frame,
+            overlay,
+            target_texture,
+            view_target,
+            mut encoder,
+            mut copies,
+            surface_frame,
+            reconfigure,
+            fg_frames,
+            fg_made,
+            checks,
+            backstop,
+            started,
+            mut laps,
+            world,
+        } = present;
         // A 0.2 pack in SDR: its picture finishes on 8 bits before the hand, the camera overlays
         // and the HUD draw over it (`overlay_format`).
         let finished = (self.output.frame.overlay_format != self.output.frame.format)
@@ -12714,28 +13091,20 @@ impl Renderer {
             }
             None => (target_texture, view_target, self.output.frame.format),
         };
-        let overlay = Overlay {
-            hand_quads: hand_quads * u32::from(!pack_draws_hand && !hand_in_world),
-            first_hand_vertex: match fg_made && frame_gen::generated_only() && self.hdr.is_some() {
-                true => made_hand_vertex,
-                false => ((world_quads + additive_quads) * 4) as i32,
-            },
-            crosshair,
-            first_crosshair: debug_depth + debug_top,
-            world_depth: scaled.is_none(),
-            msaa_depth: !fg && self.msaa_samples() > 1,
-            real: true,
-            hand_drawn: !pack_draws_hand,
-            hand_view_proj,
-        };
         let readback =
             self.draw_overlay(&mut encoder, frame, &view_target, &target_texture, &overlay);
-        if culling && let Some(cull) = &mut self.cull {
-            cull.end(&self.device, &mut encoder);
-        }
-        // GPU culling's counts once its world passes are done (phase 2's too).
-        if gpu_frame && let Some(gpu) = &mut self.gpu_culling {
-            gpu.copy_stats(&mut encoder, serial, cpu);
+        if let Some(world) = &world {
+            if world.culling
+                && let Some(cull) = &mut self.cull
+            {
+                cull.end(&self.device, &mut encoder);
+            }
+            // GPU culling's counts once its world passes are done (phase 2's too).
+            if let Some((serial, cpu)) = world.gpu_stats
+                && let Some(gpu) = &mut self.gpu_culling
+            {
+                gpu.copy_stats(&mut encoder, serial, cpu);
+            }
         }
         if let Some(timer) = &mut self.gpu_timer {
             timer.end(&self.device, &mut encoder, (&view_target, overlay_format));
@@ -12756,7 +13125,7 @@ impl Renderer {
         };
         let readback = readback.or_else(|| {
             self.screenshot
-                .take()
+                .take_if(|request| !frame.gui_only || request.size.is_none())
                 .and_then(|request| self.take_readback(request, &mut encoder, shown_texture))
         });
         let exporting = self
@@ -12888,9 +13257,7 @@ impl Renderer {
                     // The frame's waits for the previous one on the submit thread.
                     self.last_wait += self.queue.take_waited();
                     self.last_encode = started.elapsed().saturating_sub(self.last_wait);
-                    self.visible = visible;
-                    self.visible_lods = visible_lods;
-                    self.shadow_visible = shadow_visible;
+                    self.restore_drawn_world(world);
                     return Ok(true);
                 }
                 Err((back, first)) => {
@@ -12962,7 +13329,13 @@ impl Renderer {
         if checks.is_none() {
             self.given_up = 0;
         }
+        let screenshot = checks.is_some();
         let failed = checks.and_then(GpuChecks::pop);
+        // A pack's image or storage buffer of a size of its own, made in this frame without
+        // scopes of its own, stays invalid where the frame's scopes failed (#13624).
+        if screenshot && let Some((_, Some(post))) = &mut self.pack_post {
+            post.screenshot_checked(failed.is_some());
+        }
         if failed.is_some() {
             // A scaled screenshot's encoder hit a GPU error and may have been rejected:
             // invalidate incremental caches and re-upload on the next frame.
@@ -13047,10 +13420,16 @@ impl Renderer {
         self.queue.take_waited();
         self.last_encode = started.elapsed().saturating_sub(self.last_wait);
         let _ = self.started;
-        self.visible = visible;
-        self.visible_lods = visible_lods;
-        self.shadow_visible = shadow_visible;
+        self.restore_drawn_world(world);
         export_result.map(|()| true)
+    }
+
+    fn restore_drawn_world(&mut self, world: Option<DrawnWorld>) {
+        if let Some(world) = world {
+            self.visible = world.visible;
+            self.visible_lods = world.visible_lods;
+            self.shadow_visible = world.shadow_visible;
+        }
     }
 }
 impl Renderer {
@@ -13075,8 +13454,9 @@ impl Renderer {
         // HDR output's layered frame takes the hand and the camera overlays as light, with the
         // world (`Hdr::layered`).
         let layered = self.hdr.as_ref().is_some_and(|h| h.layered());
+        let world = !frame.title && !frame.gui_only;
         if let Some(hdr) = &self.hdr {
-            hdr.begin_staged(&mut self.uploads, encoder, !frame.title);
+            hdr.begin_staged(&mut self.uploads, encoder, world);
         }
         if overlay.hand_quads > 0 {
             let attachments = [Some(wgpu::RenderPassColorAttachment {
@@ -13109,7 +13489,7 @@ impl Renderer {
             pass.draw_indexed(0..overlay.hand_quads * 6, overlay.first_hand_vertex, 0..1);
         }
         // A native mod's turn after the hand, on the real frame only.
-        if overlay.real && !frame.title && native_render::hand_drawn_hooked() {
+        if overlay.real && world && native_render::hand_drawn_hooked() {
             native_render::hand_drawn(&mut native_render::HandDrawn {
                 device: &self.device,
                 queue: &self.queue,
@@ -13126,23 +13506,25 @@ impl Renderer {
             });
         }
         // GameRenderer.render: LevelRenderer.blitEntityOutline after the level and the hand.
-        self.entity_outline.draw(
-            encoder,
-            view_target,
-            &self.entity_group,
-            &self.indices,
-            &self.entity_buffer,
-            timing.as_mut(),
-        );
+        if !frame.gui_only {
+            self.entity_outline.draw(
+                encoder,
+                view_target,
+                &self.entity_group,
+                &self.indices,
+                &self.entity_buffer,
+                timing.as_mut(),
+            );
+        }
         // The world icon grabs here: after the level and the hand, before
         // the effects and the HUD draw over them (`tryTakeScreenshotIfNeeded`
         // runs right after `renderLevel`).
         let readback = self
             .screenshot
-            .take_if(|request| overlay.real && request.size.is_some())
+            .take_if(|request| !frame.gui_only && overlay.real && request.size.is_some())
             .and_then(|request| self.take_readback(request, encoder, target_texture));
         // GameRenderer.render: applyPostEffects, after the level and before the GUI.
-        if !frame.title
+        if world
             && !frame.post_effects.effects.is_empty()
             && target_texture
                 .usage()
@@ -13184,7 +13566,7 @@ impl Renderer {
         // The layered frame's light eases into the peak, before the camera overlays draw on it,
         // unless a 0.2 pack's own `[tonemap]` did.
         let pack_tonemap = self.executor.is_some_and(|c| c.tone_curve);
-        if horizon_tone_curve(layered, !frame.title, pack_tonemap)
+        if horizon_tone_curve(layered, world, pack_tonemap)
             && let Some(hdr) = &self.hdr
         {
             hdr.tonemap(encoder, timing.as_mut());
@@ -13527,7 +13909,35 @@ fn camera_section(camera: DVec3, min_y: i32) -> SectionKey {
 /// The near plane of the world's projection, in blocks.
 const NEAR_PLANE: f32 = 0.05;
 
+/// The inputs shared by world and GUI-only frames after preparing their color target.
+struct PresentFrame<'frame, 'data> {
+    frame: &'frame Frame<'data>,
+    overlay: Overlay,
+    target_texture: wgpu::Texture,
+    view_target: wgpu::TextureView,
+    encoder: wgpu::CommandEncoder,
+    copies: Option<wgpu::CommandBuffer>,
+    surface_frame: Option<wgpu::SurfaceTexture>,
+    reconfigure: bool,
+    fg_frames: Option<(wgpu::Texture, wgpu::Texture)>,
+    fg_made: bool,
+    checks: Option<GpuChecks>,
+    backstop: Option<GpuChecks>,
+    started: Instant,
+    laps: crate::spans::Laps,
+    world: Option<DrawnWorld>,
+}
+
+struct DrawnWorld {
+    visible: Vec<resident::Visible>,
+    visible_lods: Vec<lod::Visible>,
+    shadow_visible: Vec<resident::Visible>,
+    culling: bool,
+    gpu_stats: Option<(u64, [usize; 3])>,
+}
+
 /// Counts and offsets `Renderer::draw_overlay` draws from this frame's buffers.
+#[derive(Default)]
 struct Overlay {
     /// Zero when a shader pack draws the hand.
     hand_quads: u32,

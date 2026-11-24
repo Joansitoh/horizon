@@ -1920,9 +1920,10 @@ struct Game<'a> {
     acting_abilities: Option<horizon_client::lan::abilities::PlayerAbilities>,
     /// Other players in the current guest turn, including borrowed ancestor bodies.
     lan_building_boxes: building_players::BuildingPlayers,
-    /// A guest's `/save-all`: saved once their turn ends (`run_guest_command`),
-    /// when their own state is back in their record.
-    save_after_guest_turn: bool,
+    /// A guest's `/save-all`: one entry per execution that asked for a save,
+    /// with the feedback it decided while its source was current, saved once
+    /// their turn ends (`run_guest_command`), their state back in their record.
+    save_after_guest_turn: Vec<commands::DeferredSaveAll>,
     /// Guests whose records are displaced by nested player swaps, outer first.
     lan_guest_swaps: Vec<u32>,
     /// Outer vehicle(s) displaced by nested guest turns, outer first.
@@ -2649,7 +2650,7 @@ impl Game<'_> {
         held: Option<&ItemStack>,
         block_entity: Option<horizon_core::nbt::Tag>,
     ) -> Vec<ItemStack> {
-        let dynamic = self.pending.dynamic(pos);
+        let dynamic = self.pending.dynamic(pos, &self.items().component_defaults);
         let place =
             self.loot_place_with_block(pos.map(|v| f64::from(v) + 0.5), block_entity, Some(state));
         let (_, entity) = self.native_clicker();
@@ -4820,12 +4821,15 @@ impl Game<'_> {
             + self.clock.fraction() as f32)
             / 24000.0;
         let (w, h) = (batch.width, batch.height);
+        // DialogScreen keeps its previous screen for closing, but only the
+        // active screen is rendered by Gui.extractRenderState.
+        let dialog = self.dialog_open();
         // HDR calibration ends when its page does, whatever moved the screen
         // off Options (a death screen opened by a server, say).
         if self.screen != Screen::Options && self.ui.options.calibration_window.is_some() {
             self.show_calibration((w, h));
         }
-        if self.screen == Screen::Win {
+        if !dialog && self.screen == Screen::Win {
             let drawn = self.draw_screen_with_pre_hook(batch);
             if drawn {
                 self.draw_win_screen(batch);
@@ -4835,7 +4839,7 @@ impl Game<'_> {
             self.draw_screen_with_post_hook(batch);
             return;
         }
-        if self.screen == Screen::Options {
+        if !dialog && self.screen == Screen::Options {
             if self.title.is_none() {
                 self.flush_skin_slots();
                 self.update_remote_skins();
@@ -4944,7 +4948,7 @@ impl Game<'_> {
         // rest of the HUD.
         let subtitles = subtitles(
             show_hud,
-            in_game_ui(self.screen, self.book.is_some() || self.sign_edit.is_some()),
+            !dialog && in_game_ui(self.screen, self.book.is_some() || self.sign_edit.is_some()),
         );
         // The mods' layers (`register_gui_layers`) draw among vanilla's while the HUD shows.
         self.hud_layer_next = show_hud.then_some(0);
@@ -5027,6 +5031,8 @@ impl Game<'_> {
                     };
                     draws.clear();
                     hud_layout::hotbar_into(wi, hi, &inputs, &mut draws);
+                    batch.stock_hotbar_origin =
+                        Some(hud_layout::hotbar_origin(wi, hi).map(|v| v as f32));
                     hud_layout::paint_with_scratch(batch, &g.gui.atlas, &draws, &mut glyph_scratch);
                     for d in &draws {
                         if let hud_layout::GuiDraw::Item { slot, x, y, .. } = *d {
@@ -5042,6 +5048,7 @@ impl Game<'_> {
                     }
                 }
             });
+            batch.stock_hotbar_origin = None;
             self.gui_layer("minecraft:effects", batch, |g, batch| {
                 // The PvP & HUD effects widget takes the icons' place.
                 if !g.pvp_effects_shown() {
@@ -5113,8 +5120,11 @@ impl Game<'_> {
                 let health_draws: &[hud_layout::GuiDraw] = match &native_health_hud {
                     Some(native) => native.as_slice(),
                     None => {
+                        let mut blink = self.health_hud.heart_blink(inputs.tick);
+                        self.native_heart_blink(&mut blink);
                         draws.clear();
-                        self.health_hud.layout_into(&inputs, wi, hi, &mut draws);
+                        self.health_hud
+                            .layout_into_with_heart_blink(&inputs, wi, hi, blink, &mut draws);
                         draws.as_slice()
                     }
                 };
@@ -5262,7 +5272,7 @@ impl Game<'_> {
         } else {
             self.screen
         };
-        let drawn = self.draw_screen_with_pre_hook(batch);
+        let drawn = !dialog && self.draw_screen_with_pre_hook(batch);
         match screen {
             _ if !drawn => {}
             Screen::Paused if self.pause_menu => self.draw_pause_menu(batch),
@@ -5327,10 +5337,12 @@ impl Game<'_> {
         // tooltips, so a native mod draws over it here. Never `Playing`: the
         // prompts, books and sign editors drawn over gameplay keep it, draw
         // after this point and so over what a mod drew.
-        self.draw_screen_with_post_hook(batch);
+        if !dialog {
+            self.draw_screen_with_post_hook(batch);
+        }
         self.draw_saving_indicator(batch);
         self.draw_every_toast(batch, !show_hud);
-        if self.server_packs.prompt.is_none() {
+        if !dialog && self.server_packs.prompt.is_none() {
             self.remote_hud(batch);
             self.draw_sign_editor(batch);
             self.draw_book(batch);
@@ -6521,6 +6533,9 @@ impl Game<'_> {
         self.world = world;
         self.inventory = inventory;
         self.save = self.with_profession_save_snapshot(save);
+        if let Some(tables) = self.save.tables.get() {
+            tables.install_component_item_tags(&self.ui.registries.item_tags);
+        }
         // MinecraftServer.prepareLevels: the saved tickets come back.
         self.tickets = if self.options.execution_role.is_client() {
             Default::default()
@@ -8003,23 +8018,36 @@ impl Game<'_> {
     }
     /// The saved player's hands, armor, body, saddle and ender chest go in
     /// their fields; the 36 inventory slots come back.
+    ///
+    /// `ItemStack.CODEC` builds each against this world's item prototypes: a
+    /// saved value equal to the prototype's is left out of the stack's patch.
     fn load_saved_inventory(&mut self, level: &Level) -> Vec<Option<ItemStack>> {
+        let prototypes = self.items().component_defaults.clone();
+        let canonical = |mut stack: ItemStack| {
+            horizon_client::item_data::clean_stack(&mut stack, &prototypes);
+            stack
+        };
         let mut inventory = vec![None; 36];
         self.armor = [None, None, None, None];
         self.offhand = None;
         self.equipment = Default::default();
         self.ender_items = if level.ender_items.len() == 27 {
-            level.ender_items.clone()
+            level
+                .ender_items
+                .iter()
+                .cloned()
+                .map(|s| s.map(canonical))
+                .collect()
         } else {
             vec![None; 27]
         };
         for (slot, id, count, damage) in &level.inventory {
-            let stack = ItemStack {
+            let stack = canonical(ItemStack {
                 item: Arc::from(id.as_str()),
                 count: *count,
                 damage: *damage,
                 extra: level.inventory_components.get(slot).cloned(),
-            };
+            });
             if (100..104).contains(slot) {
                 self.armor[usize::from(103 - slot)] = Some(stack);
             } else if *slot == 150 {
@@ -8269,6 +8297,30 @@ impl Game<'_> {
             return Ok(false);
         };
         pr.lap("pr_setup");
+        if mod_api::__private::listened(mod_api::HookId::RenderFrame)
+            && self.title.is_none()
+            && self.player.is_some()
+            && !self.remote_screen_up()
+            && self
+                .remote
+                .as_ref()
+                .is_none_or(|remote| remote.reconfiguring.is_none())
+            && self.pending_save.is_none()
+        {
+            let mut gui_only = false;
+            self.native_render_frame(&mut gui_only);
+            if gui_only {
+                self.native_camera_frame = None;
+                self.locator_camera = None;
+                self.screen_blur_requested.set(false);
+                let mut hud = self.prepare_frame_hud(size);
+                hud.patches.append(&mut self.map_patches);
+                hud.patches.append(self.text_patches.get_mut());
+                pr.lap("pr_hud");
+                drop(prepare);
+                return self.draw_gui_only_frame(hud, consume);
+            }
+        }
         let alpha = self.frame_world_partial_tick();
         // Camera.getCameraEntityPartialTicks: the view, the hand and the
         // player's own model stay smooth while the level is frozen.
@@ -8659,11 +8711,7 @@ impl Game<'_> {
         let _projection_frame = (!title).then(|| self.activate_projection_frame());
         pr.lap("pr_projection");
         // GUI hooks project against this frame's camera, including its bob/spin and FOV.
-        let mut hud = std::mem::replace(&mut self.hud_batch, HudBatch::scratch([1, 1]));
-        horizon_client::spans::time("hud", || self.hud_into(size, &mut hud));
-        self.flush_ime(&mut hud);
-        self.native_gui_render_post(&mut hud, self.ui.hide_gui, self.focused);
-        self.resolve_inline_profiles(&hud.inline_profiles);
+        let mut hud = self.prepare_frame_hud(size);
         pr.lap("pr_hud");
         self.locator_camera =
             (!title).then_some((camera.to_array(), view_yaw, view_pitch, fov_degrees));
@@ -8699,7 +8747,10 @@ impl Game<'_> {
         };
         self.view_frustum =
             self.world_view_frustum(camera, [fov_degrees, yaw, pitch], bob * spin, depth_far);
-        let billboard_frustum = if self.settings.horizon.taa {
+        // The world is jittered by the player's TAA or by a pack's `[frame] jitter`.
+        let jittered =
+            self.settings.horizon.taa || self.renderer.as_ref().is_some_and(|r| r.pack_jitters());
+        let billboard_frustum = if jittered {
             self.renderer.as_ref().map(|r| {
                 r.camera_frustum_with_jitter(fov_degrees, yaw, pitch, bob * spin, depth_far)
             })
@@ -8823,11 +8874,7 @@ impl Game<'_> {
             self.gather_dynamic_lights(camera, alpha);
         }
         pr.lap("pr_lights");
-        pack_inputs.frame_timing = self
-            .screenshot_sequence
-            .as_ref()
-            .map(screenshot_sequence::Sequence::timing)
-            .or_else(|| self.export.as_ref().map(export::Session::timing));
+        pack_inputs.frame_timing = self.frame_timing();
         pr.lap("pr_shader_inputs");
         // Fog hooks may clear particles too. They must run before the final clear
         // boundary, not while constructing Frame after geometry has been extracted.
@@ -8892,6 +8939,7 @@ impl Game<'_> {
                 self.water_plane(camera)
             },
             title,
+            gui_only: false,
             sky_blocked: horizon_client::fog::sky_pass_skipped(
                 self.camera_submersion([camera.x, camera.y, camera.z]),
                 self.potions.effects.get("blindness").is_some()
@@ -9017,18 +9065,13 @@ impl Game<'_> {
         let mut prepared_draws = std::mem::take(&mut *self.prepared_model_draws.borrow_mut());
         let result = match self.renderer.as_mut() {
             Some(renderer) => {
-                use horizon_client::client_perf::request::GpuSwitch;
-                let capture_gpu = self.profile.gpu();
-                let recording = capture_gpu != GpuSwitch::Off;
-                renderer.set_pass_timing(debug_passes || self.gpu_passes || recording);
-                renderer.set_keep_timed_frames(recording);
-                renderer.set_pass_detail(self.gpu_pass_detail || capture_gpu == GpuSwitch::Detail);
-                // `gpu_passes` and a capture's `--gpu` are measurements: they take every sample they can.
-                renderer.set_pass_timing_gap(if self.gpu_passes || recording {
-                    Duration::ZERO
-                } else {
-                    horizon_client::debug_overlay::GPU_TIMING_GAP
-                });
+                configure_frame_timing(
+                    renderer,
+                    self.profile.gpu(),
+                    debug_passes,
+                    self.gpu_passes,
+                    self.gpu_pass_detail,
+                );
                 self.native_shaders.hand_over(renderer);
                 renderer.stage_prepared_draws(&prepared_draws);
                 consume(renderer, &frame)
@@ -9064,6 +9107,75 @@ impl Game<'_> {
         self.see_through_vertices = see_through;
         result
     }
+
+    /// Takes `hud_batch` for this frame's HUD; the frame gives it back when it ends.
+    fn prepare_frame_hud(&mut self, size: [u32; 2]) -> HudBatch {
+        let mut hud = std::mem::replace(&mut self.hud_batch, HudBatch::scratch([1, 1]));
+        horizon_client::spans::time("hud", || self.hud_into(size, &mut hud));
+        self.flush_ime(&mut hud);
+        self.native_gui_render_post(&mut hud, self.ui.hide_gui, self.focused);
+        self.resolve_inline_profiles(&hud.inline_profiles);
+        hud
+    }
+
+    fn frame_timing(&self) -> Option<horizon_client::gfx::pack_uniforms::FrameTiming> {
+        self.screenshot_sequence
+            .as_ref()
+            .map(screenshot_sequence::Sequence::timing)
+            .or_else(|| self.export.as_ref().map(export::Session::timing))
+    }
+
+    fn draw_gui_only_frame(
+        &mut self,
+        hud: HudBatch,
+        consume: impl FnOnce(&mut Renderer, &Frame<'_>) -> Result<bool>,
+    ) -> Result<bool> {
+        let mut frame = loading_frame(&hud);
+        frame.title = false;
+        frame.gui_only = true;
+        frame.ticks = self.texture_clock();
+        frame.glint_alpha = self.glint_frame.alpha;
+        frame.glint_ticks = self.glint_frame.scroll_ticks();
+        frame.pack.frame_timing = self.frame_timing();
+        frame.menu_blur = self.menu_blur();
+        let debug_passes = self.debug_lists_gpu_passes();
+        let renderer = self
+            .renderer
+            .as_mut()
+            .expect("renderer checked before GUI preparation");
+        configure_frame_timing(
+            renderer,
+            self.profile.gpu(),
+            debug_passes,
+            self.gpu_passes,
+            self.gpu_pass_detail,
+        );
+        let result = consume(renderer, &frame);
+        self.frame_drawn = matches!(result, Ok(true));
+        drop(frame);
+        self.hud_batch = hud;
+        result
+    }
+}
+
+fn configure_frame_timing(
+    renderer: &mut Renderer,
+    capture_gpu: horizon_client::client_perf::request::GpuSwitch,
+    debug_passes: bool,
+    gpu_passes: bool,
+    pass_detail: bool,
+) {
+    use horizon_client::client_perf::request::GpuSwitch;
+    let recording = capture_gpu != GpuSwitch::Off;
+    renderer.set_pass_timing(debug_passes || gpu_passes || recording);
+    renderer.set_keep_timed_frames(recording);
+    renderer.set_pass_detail(pass_detail || capture_gpu == GpuSwitch::Detail);
+    // `gpu_passes` and a capture's `--gpu` are measurements: they take every sample they can.
+    renderer.set_pass_timing_gap(if gpu_passes || recording {
+        Duration::ZERO
+    } else {
+        horizon_client::debug_overlay::GPU_TIMING_GAP
+    });
 }
 /// `computeNextAutosaveInterval`'s arithmetic: `Math.max(100, (int)(rate * 300.0F))`.
 fn autosave_interval(rate: f32) -> i64 {
@@ -11327,7 +11439,7 @@ impl<'a> Game<'a> {
             acting_abilities: None,
             native_commands: Default::default(),
             lan_building_boxes: Default::default(),
-            save_after_guest_turn: false,
+            save_after_guest_turn: Vec::new(),
             lan_guest_swaps: Vec::new(),
             lan_outer_ridings: Vec::new(),
             lan_interrupted_turns: Vec::new(),

@@ -197,6 +197,20 @@ Typed humanoid parts have separate storage, so all twelve fit alongside the eigh
 - The body loses the part, and so do the layers drawn on the body's own model, as vanilla's
   `getParentModel()` layers do: a villager's type, profession and level, a spider's eyes. The
   armour, held items and other layers keep every part, and the cape, a layer of its own, stays.
+- In `render_player_pre`, `hidden.hide_named("cape")` leaves out the player's cape instead (vanilla's
+  `showCape`): what a mod's armour over the back needs, as Mekanism's MekaSuit hides it.
+
+## A player's skin for your own model
+
+A mod that builds a player's model itself (a 3D map drawing every player from above, a
+portrait) textures it from the player's skin with `player_skin(entity)`. The answer says
+where the skin (64x64) and the cape (64x32, `None` without one) lie in the GUI atlas,
+the atlas entity quads sample (`WorldDrawn::atlas` in a native render mod), and whether
+the model is slim (3-pixel arms). It is the skin this client draws: the downloaded one
+once it is in the atlas, the profile's default until then, and for the local player the
+cape follows the Skin Customization option. Downloaded skins share a few atlas slots, so
+a region holds for the frame you ask in; ask each frame you draw. A mannequin answers
+like a player, and every other entity answers `None`.
 
 ## Drawing the player's arms with a held item
 
